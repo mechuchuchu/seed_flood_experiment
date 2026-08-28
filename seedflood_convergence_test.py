@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, Subset
 import numpy as np
 import time
 import json
+from collections import deque
+from tqdm import tqdm
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"device: {device}")
@@ -110,8 +112,10 @@ def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100, update_mode="sign")
     model = make_model()
     node_iters = [iter(dl) for dl in node_loaders]
     log = []
+    roll = deque(maxlen=100)
     t0 = time.time()
-    for r in range(n_rounds):
+    pbar = tqdm(range(n_rounds), desc="ZO")
+    for r in pbar:
         node_results = []
         approx_losses = []
         for i, dl in enumerate(node_loaders):
@@ -125,11 +129,14 @@ def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100, update_mode="sign")
             approx_losses.append(approx_loss)
         apply_zo_update(model, node_results, lr, mode=update_mode)
 
+        roll.append(float(np.mean(approx_losses)))
+        pbar.set_postfix(avg100=f"{np.mean(roll):.4f}")
+
         if r % log_every == 0 or r == n_rounds - 1:
             test_loss = eval_test_loss(model)
             elapsed = time.time() - t0
-            print(f"[ZO] round {r:5d} train~{np.mean(approx_losses):.4f} test={test_loss:.4f} ({elapsed:.1f}s)")
-            log.append({"round": r, "train_approx": float(np.mean(approx_losses)), "test_loss": test_loss, "time": elapsed})
+            log.append({"round": r, "train_approx": float(np.mean(approx_losses)),
+                        "train_avg100": float(np.mean(roll)), "test_loss": test_loss, "time": elapsed})
     return log
 
 # ---------------- FO SGD baseline ----------------
@@ -138,8 +145,10 @@ def train_fo(n_rounds=3000, lr=1e-2, log_every=100):
     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
     node_iters = [iter(dl) for dl in node_loaders]
     log = []
+    roll = deque(maxlen=100)
     t0 = time.time()
-    for r in range(n_rounds):
+    pbar = tqdm(range(n_rounds), desc="FO")
+    for r in pbar:
         # average grads across nodes (like DDP all-reduce), single param update
         opt.zero_grad()
         losses = []
@@ -156,21 +165,24 @@ def train_fo(n_rounds=3000, lr=1e-2, log_every=100):
             losses.append(loss.item() * N_NODES)
         opt.step()
 
+        roll.append(float(np.mean(losses)))
+        pbar.set_postfix(avg100=f"{np.mean(roll):.4f}")
+
         if r % log_every == 0 or r == n_rounds - 1:
             test_loss = eval_test_loss(model)
             elapsed = time.time() - t0
-            print(f"[FO] round {r:5d} train={np.mean(losses):.4f} test={test_loss:.4f} ({elapsed:.1f}s)")
-            log.append({"round": r, "train_loss": float(np.mean(losses)), "test_loss": test_loss, "time": elapsed})
+            log.append({"round": r, "train_loss": float(np.mean(losses)),
+                        "train_avg100": float(np.mean(roll)), "test_loss": test_loss, "time": elapsed})
     return log
 
 if __name__ == "__main__":
     N_ROUNDS = 3000  # ZO 논문 기준 FO의 ~5-10x iter 필요하다고 봄
 
     print("=== FO SGD baseline ===")
-    fo_log = train_fo(n_rounds=N_ROUNDS, lr=0.01)
+    fo_log = train_fo(n_rounds=N_ROUNDS, lr=1e-3)
 
     print("\n=== SeedFlood ZO ===")
-    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3)  # ZO는 더 많은 iter 필요 가정
+    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3)  # ZO는 더 많은 iter 필요 가정
 
     with open("convergence_results.json", "w") as f:
         json.dump({"fo": fo_log, "zo": zo_log}, f, indent=2)
