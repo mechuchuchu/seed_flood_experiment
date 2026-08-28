@@ -42,7 +42,7 @@ def main():
     # torch import 순서/device 설정은 각 프로세스가 독립이라 여기서 자유롭게 결정
     torch.set_num_threads(1)  # bash에서 -P N개 프로세스 띄울 거라 프로세스당 1 thread로 제한
     if args.device == "cpu":
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # 이 프로세스에선 아예 CUDA 안 건드리게
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # "" 대신 -1: NVML UUID hex 파싱 버그 회피
 
     import mnist_seedflood_sweep as base  # import 시점에 데이터 로드 (이 프로세스 안에서만)
 
