@@ -11,6 +11,13 @@ Key design:
 Run: python parallel_sweep.py
 """
 import os
+
+# fork + CUDA는 양립 불가 (부모에서 CUDA context 초기화되면 fork된 child에서 재초기화 에러).
+# 이 sweep은 tiny MLP × 수백 combo를 CPU worker로 병렬화하는 설계라 (COW로 데이터 공유,
+# worker당 1 thread), torch import 전에 GPU를 숨겨서 base가 device="cpu"로 뜨게 함.
+# GPU로 돌리고 싶으면 이 줄을 지우고 spawn + worker당 device 할당 방식으로 바꿔야 함 (하단 주석 참고).
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import time
 import json
 import itertools
@@ -26,7 +33,17 @@ import mnist_seedflood_sweep as base
 
 def _worker_init():
     # 워커당 1 thread로 고정 -> N_proc x N_thread 오버섭스크립션 방지
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
+
+# [GPU로 돌리고 싶을 때 (참고)]
+# 1) 위의 CUDA_VISIBLE_DEVICES="" 줄 제거
+# 2) mp.get_context("spawn") 사용 — 단, spawn은 child가 base를 재import하므로
+#    MNIST가 worker마다 다시 로드됨 (COW 공유 무효). MNIST는 작아서 감수 가능.
+# 3) worker 수를 GPU당 1~2개로 제한하고 initializer에서
+#    torch.cuda.set_device(worker_rank % n_gpus) 식으로 할당.
+#    tiny MLP는 GPU 한 개에 worker 여러 개 붙이면 context 경합으로 오히려 느려짐.
 
 
 def run_one_combo(params):
