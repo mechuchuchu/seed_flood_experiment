@@ -62,7 +62,7 @@ class NodeSampler:
         return normalize(train_x[sel]), train_y[sel]
 
 N_NODES = 4
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 node_samplers_seedbase = 1000
 
 def make_node_samplers():
