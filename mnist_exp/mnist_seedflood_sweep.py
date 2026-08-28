@@ -296,3 +296,6 @@ if __name__ == "__main__":
     with open("mnist_sweep_results.json", "w") as f:
         json.dump({"sign": sweep_sign, "adam": sweep_adam, "adam_beta": sweep_beta}, f, indent=2)
     print("\nsaved to mnist_sweep_results.json")
+    with open("mnist_sweep_results.json", "w") as f:
+        json.dump({"sign": sweep_sign, "adam": sweep_adam, "adam_beta": sweep_beta}, f, indent=2)
+    print("\nsaved to mnist_sweep_results.json")
