@@ -246,20 +246,53 @@ def sweep(mode="sign", n_rounds=500, lrs=(1e-1, 1e-2, 1e-3), mus=(1e-1, 1e-2, 1e
         print(f"{r['lr']:>10.4g} {r['mu']:>10.4g} {r['test_loss']:>10.4f} {r['test_acc']:>8.3f}  {r['status']}")
     return results
 
+def sweep_adam_beta(n_rounds=500, lrs=(1e-3,), mus=(1e-2,),
+                     betas_list=((0.9, 0.999), (0.5, 0.999), (0.9, 0.99), (0.5, 0.9), (0.0, 0.999))):
+    """lr, mu는 좁혀놓고 betas 축만 sweep. 넓게 하려면 lrs/mus에 여러개 넣으면 4차원 grid."""
+    results = []
+    combos = list(itertools.product(lrs, mus, betas_list))
+    for lr, mu, betas in tqdm(combos, desc="sweep(adam-beta)"):
+        try:
+            model, log = train_zo_adam(n_rounds, lr=lr, mu=mu, betas=betas,
+                                        log_every=n_rounds - 1, quiet=True)
+            final = log[-1]
+            status = "OK"
+            if not np.isfinite(final["test_loss"]) or final["test_loss"] > 10:
+                status = "DIVERGED"
+        except Exception as e:
+            final = {"test_loss": float("nan"), "test_acc": 0.0}
+            status = f"ERROR: {e}"
+        results.append({"lr": lr, "mu": mu, "beta1": betas[0], "beta2": betas[1],
+                        "test_loss": final["test_loss"], "test_acc": final["test_acc"], "status": status})
+
+    results.sort(key=lambda r: r["test_loss"] if np.isfinite(r["test_loss"]) else 1e9)
+    print(f"\n=== adam beta sweep ({n_rounds} rounds) ===")
+    print(f"{'lr':>10} {'mu':>10} {'b1':>6} {'b2':>7} {'test_loss':>10} {'test_acc':>8}  status")
+    for r in results:
+        print(f"{r['lr']:>10.4g} {r['mu']:>10.4g} {r['beta1']:>6.2f} {r['beta2']:>7.4f} "
+              f"{r['test_loss']:>10.4f} {r['test_acc']:>8.3f}  {r['status']}")
+    return results
+
+
 if __name__ == "__main__":
-    N_ROUNDS = 500  # MNIST + tiny MLP라 이 정도면 몇 십초~몇 분 내 끝남
+    N_ROUNDS = 500
 
     print("=== FO baseline (sanity check) ===")
     train_fo(N_ROUNDS, lr=0.1)
 
-    print("\n=== lr/mu sweep: ZO sign ===")
+    print("\n=== narrowed lr/mu sweep: ZO sign ===")
     sweep_sign = sweep(mode="sign", n_rounds=N_ROUNDS,
-                        lrs=(1e-1, 1e-2, 1e-3, 1e-4), mus=(1e-1, 1e-2, 1e-3))
+                        lrs=(3e-4, 1e-3, 3e-3), mus=(5e-3, 1e-2, 2e-2))
 
-    print("\n=== lr/mu sweep: ZO-Adam ===")
+    print("\n=== narrowed lr/mu sweep: ZO-Adam (default betas) ===")
     sweep_adam = sweep(mode="adam", n_rounds=N_ROUNDS,
-                        lrs=(1e-2, 1e-3, 1e-4), mus=(1e-1, 1e-2, 1e-3))
+                        lrs=(3e-4, 1e-3, 3e-3), mus=(5e-3, 1e-2, 2e-2))
+
+    print("\n=== Adam beta sweep (lr=1e-3, mu=1e-2 fixed from best above) ===")
+    sweep_beta = sweep_adam_beta(n_rounds=N_ROUNDS, lrs=(1e-3,), mus=(1e-2,),
+                                  betas_list=((0.9, 0.999), (0.5, 0.999), (0.9, 0.99),
+                                              (0.5, 0.9), (0.0, 0.999), (0.9, 0.9999)))
 
     with open("mnist_sweep_results.json", "w") as f:
-        json.dump({"sign": sweep_sign, "adam": sweep_adam}, f, indent=2)
+        json.dump({"sign": sweep_sign, "adam": sweep_adam, "adam_beta": sweep_beta}, f, indent=2)
     print("\nsaved to mnist_sweep_results.json")
