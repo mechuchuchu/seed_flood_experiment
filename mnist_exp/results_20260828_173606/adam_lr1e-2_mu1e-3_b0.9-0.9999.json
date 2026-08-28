@@ -1,0 +1,1 @@
+{"mode": "adam", "lr": 0.01, "mu": 0.001, "beta1": 0.9, "beta2": 0.9999, "n_rounds": 300, "seed": 0, "test_loss": 22.52717819213867, "test_acc": 0.2662, "status": "DIVERGED", "elapsed_sec": 40.42}

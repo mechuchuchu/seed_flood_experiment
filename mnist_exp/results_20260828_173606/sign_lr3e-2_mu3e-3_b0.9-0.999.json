@@ -1,0 +1,1 @@
+{"mode": "sign", "lr": 0.03, "mu": 0.003, "beta1": 0.9, "beta2": 0.999, "n_rounds": 300, "seed": 0, "test_loss": 219.89393615722656, "test_acc": 0.1992, "status": "DIVERGED", "elapsed_sec": 38.91}

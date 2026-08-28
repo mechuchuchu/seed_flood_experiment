@@ -1,0 +1,1 @@
+{"mode": "adam", "lr": 0.001, "mu": 0.001, "beta1": 0.5, "beta2": 0.9, "n_rounds": 300, "seed": 0, "test_loss": 2.2142001152038575, "test_acc": 0.293, "status": "OK", "elapsed_sec": 43.74}

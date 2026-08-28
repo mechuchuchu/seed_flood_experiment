@@ -1,0 +1,1 @@
+{"mode": "fo", "lr": 0.001, "mu": 0.01, "beta1": 0.9, "beta2": 0.999, "n_rounds": 300, "seed": 0, "test_loss": 0.8661955118179321, "test_acc": 0.7784, "status": "OK", "elapsed_sec": 28.28}

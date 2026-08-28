@@ -1,0 +1,1 @@
+{"mode": "raw", "lr": 0.001, "mu": 0.1, "beta1": 0.9, "beta2": 0.999, "n_rounds": 300, "seed": 0, "test_loss": 4.377221393585205, "test_acc": 0.2122, "status": "OK", "elapsed_sec": 40.28}
