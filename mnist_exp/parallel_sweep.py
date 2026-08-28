@@ -18,6 +18,14 @@ import os
 # GPU로 돌리고 싶으면 이 줄을 지우고 spawn + worker당 device 할당 방식으로 바꿔야 함 (하단 주석 참고).
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+# fork-safety 핵심: 부모가 torch import 전에 thread pool을 1로 강제.
+# 부모에서 libgomp/MKL이 멀티스레드 팀을 띄운 상태로 fork하면 child가 물려받은
+# allocator/스레드 상태가 깨진 채 시작 → "corrupted size vs. prev_size" 같은
+# heap corruption이 간헐적으로 터짐. child에서 set_num_threads(1) 하는 건
+# 이미 늦음 (fork 시점에 부모가 single-thread여야 함).
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_v] = "1"
+
 import time
 import json
 import itertools
@@ -103,11 +111,38 @@ def main():
 
     t0 = time.time()
     results = []
+    # worker가 죽으면 (heap corruption 등) 그 task의 result는 영원히 안 옴 →
+    # 기본 imap_unordered는 여기서 무한 대기 (98%에서 util 0으로 멈추는 증상).
+    # IMapIterator.next(timeout=...)로 stall을 감지하고 수집된 것만 들고 빠져나옴.
+    RESULT_TIMEOUT = 300  # 초. 가장 느린 combo 하나보다 넉넉하게.
     with mp.get_context("fork").Pool(processes=n_workers, initializer=_worker_init) as pool:
-        for res in tqdm(pool.imap_unordered(run_one_combo, combos), total=len(combos)):
-            results.append(res)
+        it = pool.imap_unordered(run_one_combo, combos)
+        with tqdm(total=len(combos)) as pbar:
+            while True:
+                try:
+                    res = it.next(timeout=RESULT_TIMEOUT)
+                except StopIteration:
+                    break
+                except mp.TimeoutError:
+                    print(f"\n[!] {RESULT_TIMEOUT}s 동안 결과 없음 — worker crash로 판단, "
+                          f"수집된 {len(results)}/{len(combos)}개만 저장하고 종료")
+                    break
+                results.append(res)
+                pbar.update(1)
     elapsed = time.time() - t0
-    print(f"done in {elapsed:.1f}s ({elapsed/len(combos):.2f}s/combo avg)")
+    print(f"done in {elapsed:.1f}s ({elapsed/max(1,len(results)):.2f}s/combo avg)")
+
+    # 유실된 combo 리포트 (죽은 worker가 들고 있던 것들) → 나중에 단독 재실행용
+    def _key(c):
+        return (c["mode"], c["lr"], c["mu"], tuple(c.get("betas", (0.9, 0.999))) if c["mu"] is not None else None)
+    done_keys = {_key(r) for r in results}
+    missing = [c for c in combos if _key(c) not in done_keys]
+    if missing:
+        print(f"[!] 유실 combo {len(missing)}개:")
+        for c in missing:
+            print(f"    {c}")
+        with open("parallel_sweep_missing.json", "w") as f:
+            json.dump(missing, f, indent=2, default=str)
 
     results.sort(key=lambda r: r["test_loss"] if np.isfinite(r["test_loss"]) else 1e9)
 
