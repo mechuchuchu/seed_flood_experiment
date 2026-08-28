@@ -108,7 +108,82 @@ def apply_zo_update(model, node_results, lr, mode="sign"):
                 z = torch.randn_like(p)
                 p.add_(z, alpha=-lr * step / len(steps))
 
-def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100, update_mode="sign"):
+@torch.no_grad()
+def reconstruct_pseudo_grad(model, node_results, mode="raw"):
+    """server-side: seed로 z 재생성해서 평균 pseudo-gradient dict 구성. 통신량엔 영향 없음 (server 내부 연산)."""
+    if mode == "sign":
+        steps = [(seed, np.sign(s)) for seed, s in node_results]
+    elif mode == "norm":
+        mags = [abs(s) for _, s in node_results]
+        denom = max(mags) if max(mags) > 0 else 1.0
+        steps = [(seed, s / denom) for seed, s in node_results]
+    else:
+        steps = node_results
+
+    pseudo_grad = {id(p): torch.zeros_like(p) for p in model.parameters() if p.requires_grad}
+    for seed, step in steps:
+        if step == 0:
+            continue
+        torch.manual_seed(seed)
+        for p in model.parameters():
+            if p.requires_grad:
+                z = torch.randn_like(p)
+                pseudo_grad[id(p)].add_(z, alpha=step / len(steps))
+    return pseudo_grad
+
+@torch.no_grad()
+def adam_zo_update(model, pseudo_grad, adam_state, t, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+    beta1, beta2 = betas
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        g = pseudo_grad[id(p)]
+        st = adam_state[id(p)]
+        st["m"].mul_(beta1).add_(g, alpha=1 - beta1)
+        st["v"].mul_(beta2).addcmul_(g, g, value=1 - beta2)
+        m_hat = st["m"] / (1 - beta1 ** t)
+        v_hat = st["v"] / (1 - beta2 ** t)
+        p.add_(m_hat / (v_hat.sqrt() + eps), alpha=-lr)
+
+def train_zo_adam(n_rounds=3000, lr=1e-3, mu=1e-3, betas=(0.9, 0.999), log_every=100,
+                   grad_recon_mode="raw"):
+    """ZO scalar 그대로(raw) 재구성해서 server-side Adam moment로 스케일/노이즈 흡수.
+    grad_recon_mode: 'raw'(scalar 그대로) / 'sign' / 'norm' 중 pseudo-grad 재구성 방식 선택."""
+    model = make_model()
+    adam_state = {id(p): {"m": torch.zeros_like(p), "v": torch.zeros_like(p)}
+                  for p in model.parameters() if p.requires_grad}
+    node_iters = [iter(dl) for dl in node_loaders]
+    log = []
+    roll = deque(maxlen=100)
+    t0 = time.time()
+    pbar = tqdm(range(1, n_rounds + 1), desc="ZO-Adam")
+    for r in pbar:
+        node_results = []
+        approx_losses = []
+        for i, dl in enumerate(node_loaders):
+            try:
+                batch = next(node_iters[i])
+            except StopIteration:
+                node_iters[i] = iter(dl)
+                batch = next(node_iters[i])
+            seed, scalar, approx_loss = zo_step(model, batch, mu=mu)
+            node_results.append((seed, scalar))
+            approx_losses.append(approx_loss)
+
+        pseudo_grad = reconstruct_pseudo_grad(model, node_results, mode=grad_recon_mode)
+        adam_zo_update(model, pseudo_grad, adam_state, t=r, lr=lr, betas=betas)
+
+        roll.append(float(np.mean(approx_losses)))
+        pbar.set_postfix(avg100=f"{np.mean(roll):.4f}")
+
+        if r % log_every == 0 or r == n_rounds:
+            test_loss = eval_test_loss(model)
+            elapsed = time.time() - t0
+            log.append({"round": r, "train_approx": float(np.mean(approx_losses)),
+                        "train_avg100": float(np.mean(roll)), "test_loss": test_loss, "time": elapsed})
+    return log
+
+
     model = make_model()
     node_iters = [iter(dl) for dl in node_loaders]
     log = []
@@ -181,9 +256,12 @@ if __name__ == "__main__":
     print("=== FO SGD baseline ===")
     fo_log = train_fo(n_rounds=N_ROUNDS, lr=1e-3)
 
-    print("\n=== SeedFlood ZO ===")
-    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3)  # ZO는 더 많은 iter 필요 가정
+    print("\n=== SeedFlood ZO (sign) ===")
+    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3, update_mode="sign")
+
+    print("\n=== SeedFlood ZO-Adam (raw scalar + server-side moments) ===")
+    zo_adam_log = train_zo_adam(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3, grad_recon_mode="raw")
 
     with open("convergence_results.json", "w") as f:
-        json.dump({"fo": fo_log, "zo": zo_log}, f, indent=2)
+        json.dump({"fo": fo_log, "zo": zo_log, "zo_adam": zo_adam_log}, f, indent=2)
     print("\nsaved to convergence_results.json")
