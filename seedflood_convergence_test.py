@@ -86,16 +86,25 @@ def zo_step(model, batch, mu=1e-3, seed=None):
 @torch.no_grad()
 def apply_zo_update(model, node_results, lr, mode="sign"):
     # mode="sign": scalar 크기 버리고 방향(+z or -z)만 사용 -> sign-ZO / ZO-signSGD
+    # mode="norm": scalar를 이번 round node들 magnitude로 나눠서 정규화 (상대적 방향 강도는 유지, outlier만 억제)
     # mode="raw": 원래 SPSA scalar 그대로 사용
-    for seed, scalar in node_results:
-        torch.manual_seed(seed)
-        step = np.sign(scalar) if mode == "sign" else scalar
+    if mode == "norm":
+        mags = [abs(s) for _, s in node_results]
+        denom = max(mags) if max(mags) > 0 else 1.0
+        steps = [(seed, s / denom) for seed, s in node_results]
+    elif mode == "sign":
+        steps = [(seed, np.sign(s)) for seed, s in node_results]
+    else:
+        steps = node_results
+
+    for seed, step in steps:
         if step == 0:
             continue
+        torch.manual_seed(seed)
         for p in model.parameters():
             if p.requires_grad:
                 z = torch.randn_like(p)
-                p.add_(z, alpha=-lr * step / len(node_results))
+                p.add_(z, alpha=-lr * step / len(steps))
 
 def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100, update_mode="sign"):
     model = make_model()
