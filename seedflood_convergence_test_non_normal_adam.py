@@ -267,15 +267,10 @@ def train_fo(n_rounds=3000, lr=1e-2, log_every=100):
 if __name__ == "__main__":
     N_ROUNDS = 3000  # ZO 논문 기준 FO의 ~5-10x iter 필요하다고 봄
 
-    print("=== FO SGD baseline ===")
-    fo_log = train_fo(n_rounds=N_ROUNDS, lr=0.01)
-
-    print("\n=== SeedFlood ZO (norm) ===")
-    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3, update_mode="norm")
 
     print("\n=== SeedFlood ZO-Adam (raw scalar + server-side moments) ===")
     zo_adam_log = train_zo_adam(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3, grad_recon_mode="raw")
 
     with open("convergence_results.json", "w") as f:
         json.dump({"fo": fo_log, "zo": zo_log, "zo_adam": zo_adam_log}, f, indent=2)
-    print("\nsaved to convergence_results.json")
+    print("\nsaved to convergence_results_non_n_adam.json")
