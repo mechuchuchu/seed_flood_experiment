@@ -278,4 +278,4 @@ if __name__ == "__main__":
 
     with open("convergence_results.json", "w") as f:
         json.dump({"fo": fo_log, "zo": zo_log, "zo_adam": zo_adam_log}, f, indent=2)
-    print("\nsaved to convergence_results.json")
+    print("\nsaved to convergence_results_lb.json")
