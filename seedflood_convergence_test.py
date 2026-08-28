@@ -205,6 +205,70 @@ def train_zo_adam(n_rounds=3000, lr=1e-3, mu=1e-3, betas=(0.9, 0.999), log_every
                         "time": time.time() - t0})
     return log
 
+@torch.no_grad()
+def zo_step_shared(model, batches, mu, seed):
+    """공유 seed 버전: 모든 node가 같은 z 방향에서 자기 배치로 loss만 측정.
+    perturb를 라운드당 3회만 하면 되므로 (node당 3회 대비) regen 비용도 절감."""
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    for p, z in _regen(params, seed):
+        p.add_(z, alpha=mu)
+    losses_pos = [loss_fn_ce(model(x), y).item() for x, y in batches]
+
+    for p, z in _regen(params, seed):
+        p.add_(z, alpha=-2 * mu)
+    losses_neg = [loss_fn_ce(model(x), y).item() for x, y in batches]
+
+    for p, z in _regen(params, seed):
+        p.add_(z, alpha=mu)  # restore
+
+    # node loss 평균 후 하나의 scalar로 (선형이라 node별 scalar 평균과 동일)
+    scalar = (np.mean(losses_pos) - np.mean(losses_neg)) / (2 * mu)
+    approx_loss = (np.mean(losses_pos) + np.mean(losses_neg)) / 2
+    return scalar, approx_loss
+
+def train_zo_shared_adam(n_rounds=3000, lr=1e-3, mu=1e-3, betas=(0.9, 0.999),
+                         log_every=100, run_seed=0):
+    """server가 seed 1개 뽑아 broadcast → 각 node는 자기 데이터로 loss만 측정해 회신
+    → server가 loss 평균 후 scalar·z로 grad 추정 → Adam.
+    통신량: down seed 1개, up loss 2개/node. 라운드당 방향 1개 (기존은 node당 1개)."""
+    model = make_model()
+    params = [p for p in model.parameters() if p.requires_grad]
+    adam_m = [torch.zeros_like(p) for p in params]
+    adam_v = [torch.zeros_like(p) for p in params]
+    samplers = make_node_samplers()
+    seed_rng = np.random.default_rng(run_seed)
+    log = []
+    roll = deque(maxlen=100)
+    t0 = time.time()
+    pbar = tqdm(range(1, n_rounds + 1), desc="ZO-shared-Adam")
+    for r in pbar:
+        seed = int(seed_rng.integers(0, 2**31 - 1))
+        batches = [s.next_batch() for s in samplers]
+        scalar, approx_loss = zo_step_shared(model, batches, mu=mu, seed=seed)
+
+        # pseudo-grad = scalar * z (seed 1개라 버퍼 없이 regen하며 바로 Adam)
+        beta1, beta2 = betas
+        with torch.no_grad():
+            for (p, z), m, v in zip(_regen(params, seed), adam_m, adam_v):
+                g = z.mul_(scalar)  # z는 일회용이라 in-place로 재활용
+                m.mul_(beta1).add_(g, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                m_hat = m / (1 - beta1 ** r)
+                v_hat = v / (1 - beta2 ** r)
+                p.add_(m_hat / (v_hat.sqrt() + 1e-8), alpha=-lr)
+
+        roll.append(float(approx_loss))
+        pbar.set_postfix(avg100=f"{np.mean(roll):.4f}")
+
+        if r % log_every == 0 or r == n_rounds:
+            test_loss, test_acc = eval_test(model)
+            log.append({"round": r, "train_approx": float(approx_loss),
+                        "train_avg100": float(np.mean(roll)),
+                        "test_loss": test_loss, "test_acc": test_acc,
+                        "time": time.time() - t0})
+    return log
+
 def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100, update_mode="sign", run_seed=0):
     model = make_model()
     samplers = make_node_samplers()
@@ -270,12 +334,16 @@ if __name__ == "__main__":
     print("=== FO SGD baseline ===")
     fo_log = train_fo(n_rounds=N_ROUNDS, lr=0.01)
 
-    print("\n=== SeedFlood ZO (norm) ===")
-    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3, update_mode="norm")
+    print("\n=== SeedFlood ZO (sign) ===")
+    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3, update_mode="sign")
 
     print("\n=== SeedFlood ZO-Adam (raw scalar + server-side moments) ===")
     zo_adam_log = train_zo_adam(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3, grad_recon_mode="raw")
 
+    print("\n=== SeedFlood ZO-shared-Adam (seed broadcast, loss averaging) ===")
+    zo_shared_log = train_zo_shared_adam(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3)
+
     with open("convergence_results.json", "w") as f:
-        json.dump({"fo": fo_log, "zo": zo_log, "zo_adam": zo_adam_log}, f, indent=2)
+        json.dump({"fo": fo_log, "zo": zo_log, "zo_adam": zo_adam_log,
+                   "zo_shared_adam": zo_shared_log}, f, indent=2)
     print("\nsaved to convergence_results.json")
