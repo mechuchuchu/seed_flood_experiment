@@ -3,10 +3,11 @@ Massive parallel lr/mu/beta sweep for MNIST SeedFlood using multiprocessing.
 Reuses model/data/train functions from mnist_seedflood_sweep.py (must be in same dir).
 
 Key design:
-- fork start method (default on Linux/Mac): dataset + node_loaders loaded ONCE in parent,
-  child processes inherit via copy-on-write -> no redundant MNIST reloading per worker.
+- spawn start method: 각 worker가 깨끗한 인터프리터에서 base를 재import (MNIST도 worker당 1회 로드).
+  fork+COW가 더 쌌지만 fork된 child에서 glibc heap corruption이 간헐 재발해서 포기.
 - each worker pins torch to 1 thread to avoid oversubscription (N_cores workers x N_threads each = chaos otherwise).
-- imap_unordered + tqdm for live progress across thousands of combos.
+- imap_unordered + per-result timeout: worker crash가 나도 sweep이 hang하지 않고
+  유실 combo를 parallel_sweep_missing.json으로 보고.
 
 Run: python parallel_sweep.py
 """
@@ -114,8 +115,11 @@ def main():
     # worker가 죽으면 (heap corruption 등) 그 task의 result는 영원히 안 옴 →
     # 기본 imap_unordered는 여기서 무한 대기 (98%에서 util 0으로 멈추는 증상).
     # IMapIterator.next(timeout=...)로 stall을 감지하고 수집된 것만 들고 빠져나옴.
-    RESULT_TIMEOUT = 300  # 초. 가장 느린 combo 하나보다 넉넉하게.
-    with mp.get_context("fork").Pool(processes=n_workers, initializer=_worker_init) as pool:
+    RESULT_TIMEOUT = 60  # 초. 가장 느린 combo 하나보다 넉넉하게.
+    # spawn: fork의 COW 공유를 포기하는 대신 각 child가 깨끗한 인터프리터에서 시작.
+    # (부모 single-thread화로도 corruption이 재발해서 fork 포기.
+    #  비용: worker당 torch import + MNIST 재로드 ~수 초, 시작할 때 한 번뿐이라 감수.)
+    with mp.get_context("spawn").Pool(processes=n_workers, initializer=_worker_init) as pool:
         it = pool.imap_unordered(run_one_combo, combos)
         with tqdm(total=len(combos)) as pbar:
             while True:
