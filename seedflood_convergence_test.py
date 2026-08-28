@@ -271,7 +271,7 @@ if __name__ == "__main__":
     fo_log = train_fo(n_rounds=N_ROUNDS, lr=0.01)
 
     print("\n=== SeedFlood ZO (sign) ===")
-    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3, update_mode="sign")
+    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3, update_mode="norm")
 
     print("\n=== SeedFlood ZO-Adam (raw scalar + server-side moments) ===")
     zo_adam_log = train_zo_adam(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3, grad_recon_mode="raw")
