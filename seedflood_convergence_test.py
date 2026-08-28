@@ -84,15 +84,20 @@ def zo_step(model, batch, mu=1e-3, seed=None):
     return seed, scalar, (loss_pos + loss_neg) / 2
 
 @torch.no_grad()
-def apply_zo_update(model, node_results, lr):
+def apply_zo_update(model, node_results, lr, mode="sign"):
+    # mode="sign": scalar 크기 버리고 방향(+z or -z)만 사용 -> sign-ZO / ZO-signSGD
+    # mode="raw": 원래 SPSA scalar 그대로 사용
     for seed, scalar in node_results:
         torch.manual_seed(seed)
+        step = np.sign(scalar) if mode == "sign" else scalar
+        if step == 0:
+            continue
         for p in model.parameters():
             if p.requires_grad:
                 z = torch.randn_like(p)
-                p.add_(z, alpha=-lr * scalar / len(node_results))
+                p.add_(z, alpha=-lr * step / len(node_results))
 
-def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100):
+def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100, update_mode="sign"):
     model = make_model()
     node_iters = [iter(dl) for dl in node_loaders]
     log = []
@@ -109,7 +114,7 @@ def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100):
             seed, scalar, approx_loss = zo_step(model, batch, mu=mu)
             node_results.append((seed, scalar))
             approx_losses.append(approx_loss)
-        apply_zo_update(model, node_results, lr)
+        apply_zo_update(model, node_results, lr, mode=update_mode)
 
         if r % log_every == 0 or r == n_rounds - 1:
             test_loss = eval_test_loss(model)
