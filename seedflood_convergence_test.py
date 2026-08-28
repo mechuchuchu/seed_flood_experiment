@@ -270,7 +270,7 @@ if __name__ == "__main__":
     print("=== FO SGD baseline ===")
     fo_log = train_fo(n_rounds=N_ROUNDS, lr=0.01)
 
-    print("\n=== SeedFlood ZO (sign) ===")
+    print("\n=== SeedFlood ZO (norm) ===")
     zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3, update_mode="norm")
 
     print("\n=== SeedFlood ZO-Adam (raw scalar + server-side moments) ===")
