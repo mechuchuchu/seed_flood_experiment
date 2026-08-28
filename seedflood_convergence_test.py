@@ -183,7 +183,7 @@ def train_zo_adam(n_rounds=3000, lr=1e-3, mu=1e-3, betas=(0.9, 0.999), log_every
                         "train_avg100": float(np.mean(roll)), "test_loss": test_loss, "time": elapsed})
     return log
 
-
+def train_zo(n_rounds=3000, lr=1e-2, mu=1e-3, log_every=100, update_mode="sign"):
     model = make_model()
     node_iters = [iter(dl) for dl in node_loaders]
     log = []
@@ -254,10 +254,10 @@ if __name__ == "__main__":
     N_ROUNDS = 3000  # ZO 논문 기준 FO의 ~5-10x iter 필요하다고 봄
 
     print("=== FO SGD baseline ===")
-    fo_log = train_fo(n_rounds=N_ROUNDS, lr=1e-3)
+    fo_log = train_fo(n_rounds=N_ROUNDS, lr=0.01)
 
     print("\n=== SeedFlood ZO (sign) ===")
-    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3, update_mode="sign")
+    zo_log = train_zo(n_rounds=N_ROUNDS * 5, lr=0.01, mu=1e-3, update_mode="sign")
 
     print("\n=== SeedFlood ZO-Adam (raw scalar + server-side moments) ===")
     zo_adam_log = train_zo_adam(n_rounds=N_ROUNDS * 5, lr=1e-3, mu=1e-3, grad_recon_mode="raw")
