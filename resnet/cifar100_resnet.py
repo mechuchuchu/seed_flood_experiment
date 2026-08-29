@@ -235,11 +235,12 @@ class RunLogger:
         self.record["history"].append(entry)
         self._dump()  # 매 eval마다 저장 → 중간에 죽어도 로그 살아있음
 
-    def finalize(self, test_loss, test_acc, elapsed):
+    def finalize(self, test_loss, test_acc, elapsed, aborted=None):
         self.record["final"] = {
             "test_loss": round(float(test_loss), 6),
             "test_acc": round(float(test_acc), 6),
             "total_sec": round(elapsed, 1),
+            "aborted": aborted,  # None이면 정상 완주, 문자열이면 조기 종료 사유
         }
         self._dump()
         print(f"[log] saved → {self.out}")
@@ -249,6 +250,54 @@ class RunLogger:
         with open(tmp, "w") as f:
             json.dump(self.record, f, indent=2)
         os.replace(tmp, self.out)
+
+
+class CollapseWatch:
+    """ZO 붕괴 조기 감지.
+
+    관찰: 붕괴한 런에서는 |g^T z| (= |grad_term|/(2μ), grad_term 없으면 |delta|/(2μ))가
+    초기 대비 자릿수로 떨어지고 loss가 ln(num_classes) 근처에 못박힌다.
+    grid sweep에서 이런 조합에 20분씩 쓰는 걸 막기 위해 조기 종료한다.
+
+    발동 조건 (min_round 이후, 전부 만족):
+      - 최근 관측의 |g^T z| 중앙값이 초기 기준값의 1/ratio 이하
+      - loss가 uniform baseline(ln C) 근처에서 개선 없음
+    """
+
+    def __init__(self, args, num_classes):
+        self.enabled = args.early_abort
+        self.min_round = args.abort_min_round
+        self.ratio = args.abort_ratio
+        self.uniform_loss = math.log(num_classes)
+        self.baseline = None      # 초기 |g^T z| 기준값
+        self.init_samples = []
+        self.recent = []
+        self.best_loss = float("inf")
+        self.reason = None
+
+    def update(self, rnd, signal, test_loss):
+        """signal = |g^T z| 추정치. 반환 True면 중단."""
+        if not self.enabled or signal is None:
+            return False
+        self.best_loss = min(self.best_loss, test_loss)
+        if self.baseline is None:
+            self.init_samples.append(signal)
+            if len(self.init_samples) >= 3:
+                self.baseline = float(np.median(self.init_samples))
+            return False
+        self.recent.append(signal)
+        self.recent = self.recent[-3:]
+        if rnd < self.min_round or len(self.recent) < 3:
+            return False
+        cur = float(np.median(self.recent))
+        signal_dead = self.baseline > 0 and cur < self.baseline / self.ratio
+        no_progress = self.best_loss > self.uniform_loss * 0.99
+        if signal_dead and no_progress:
+            self.reason = (f"signal collapse: |g^T z| {self.baseline:.3e} → {cur:.3e} "
+                           f"(x{cur / self.baseline:.1e}), best_loss {self.best_loss:.4f} "
+                           f"≥ uniform {self.uniform_loss:.4f}")
+            return True
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -299,6 +348,8 @@ def train_fo(model, data, device, args, logger):
                   f"test_loss {tl:.4f} | test_acc {ta:.4f} | {el:.0f}s")
             running = []
     logger.finalize(tl, ta, time.time() - t0)
+    logger.record["rounds_done"] = args.n_rounds
+    logger._dump()
 
 
 # ----------------------------------------------------------------------------
@@ -406,6 +457,8 @@ def train_zo(model, data, device, args, logger):
 
     running, t0 = [], time.time()
     tl = ta = float("nan")
+    watch = CollapseWatch(args, model.fc.out_features)
+    sig_window = []  # 매 라운드 |g^T z| (probe 없어도 delta로 계산 가능)
     for rnd in range(1, args.n_rounds + 1):
         seed = int(torch.randint(0, 2**31 - 1, (1,)).item())  # 라운드당 seed 1개 broadcast
 
@@ -431,6 +484,7 @@ def train_zo(model, data, device, args, logger):
 
         scalar = (l_plus - l_minus) / (2 * args.mu)
         running.append((l_plus + l_minus) / 2)
+        sig_window.append(abs(scalar))  # |g^T z| 추정 (bias 미보정)
         cur_lr = lr_at(rnd, args)
 
         is_eval_round = (rnd % args.eval_every == 0 or rnd == args.n_rounds)
@@ -484,11 +538,22 @@ def train_zo(model, data, device, args, logger):
         if is_eval_round:
             tl, ta = evaluate(model, x_test, y_test, device)
             el = time.time() - t0
+            sig_med = float(np.median(sig_window)) if sig_window else None
+            if sig_med is not None:
+                probe["zo_signal_med"] = float(f"{sig_med:.6e}")
+                probe["zo_signal_zero_frac"] = round(
+                    float(np.mean([s == 0.0 for s in sig_window])), 4)
+            sig_window = []
             logger.log(rnd, np.mean(running), tl, ta, el, lr=cur_lr, **probe)
             print(f"round {rnd:6d} | train_avg {np.mean(running):.4f} | "
                   f"test_loss {tl:.4f} | test_acc {ta:.4f} | {el:.0f}s")
             running = []
-    logger.finalize(tl, ta, time.time() - t0)
+            if watch.update(rnd, sig_med, tl):
+                print(f"[abort] round {rnd}: {watch.reason}")
+                break
+    logger.finalize(tl, ta, time.time() - t0, aborted=watch.reason)
+    logger.record["rounds_done"] = rnd
+    logger._dump()
 
 
 # ----------------------------------------------------------------------------
@@ -510,8 +575,28 @@ def default_out(args):
     return os.path.join("results", tag + ".json")
 
 
+def load_yaml_defaults(path, parser):
+    """yaml의 키를 parser default로 주입. dest 이름과 일치해야 하며,
+    CLI에서 명시한 인자가 항상 yaml을 이긴다 (argparse default 우선순위)."""
+    import yaml
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{path}: 최상위가 dict여야 함 (got {type(cfg).__name__})")
+    valid = {a.dest for a in parser._actions}
+    unknown = set(cfg) - valid
+    if unknown:
+        raise ValueError(f"{path}: 알 수 없는 키 {sorted(unknown)}  (사용 가능: {sorted(valid - {'help'})})")
+    parser.set_defaults(**cfg)
+    return cfg
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
+    p.add_argument("--config", default=None,
+                   help="yaml 설정 파일. 여기 적힌 값이 default가 되고, "
+                        "CLI로 준 인자가 그걸 override함 (grid sweep 시 "
+                        "--config base.yaml --mu 2.5e-3 식으로 사용)")
     p.add_argument("--mode", default="fo", choices=["fo", "zo_sign", "zo_adam"])
     p.add_argument("--model", default="resnet20", choices=list(MODELS))
     p.add_argument("--norm", default="auto", choices=["auto", "batch", "group"],
@@ -554,6 +639,13 @@ if __name__ == "__main__":
                         "zo_dplus / zo_dminus / zo_curv(=μ²·zᵀHz 추정) 기록 "
                         "(SPSA 선형근사 위반 = mu bias 추적, ZO 모드 전용)")
     p.add_argument("--n_nodes", type=int, default=1)
+    p.add_argument("--early_abort", action="store_true",
+                   help="|g^T z| 신호가 초기 대비 붕괴하고 loss가 uniform(ln C) 근처에 "
+                        "머물면 조기 종료 (grid sweep에서 죽은 조합 낭비 방지)")
+    p.add_argument("--abort_min_round", type=int, default=1000,
+                   help="이 라운드 이전에는 조기 종료 판정 안 함")
+    p.add_argument("--abort_ratio", type=float, default=100.0,
+                   help="신호가 초기 기준값의 1/ratio 아래로 떨어지면 붕괴로 간주")
     # misc
     p.add_argument("--augment", default="auto", choices=["auto", "on", "off"],
                    help="auto: fo=on, zo=off (aug 노이즈가 loss 차이 측정을 오염시킴)")
@@ -564,6 +656,12 @@ if __name__ == "__main__":
     p.add_argument("--data_seed", type=int, default=0, help="노드 파티션 seed")
     p.add_argument("--torch_seed", type=int, default=None, help="모델 init 재현용")
     p.add_argument("--out", default=None, help="결과 json 경로 (default: 자동 이름)")
+
+    # --config를 먼저 읽어 default로 주입한 뒤 최종 파싱 (CLI가 yaml을 이김)
+    pre, _ = p.parse_known_args()
+    if pre.config:
+        cfg = load_yaml_defaults(pre.config, p)
+        print(f"[config] {pre.config}: {len(cfg)} keys loaded")
     args = p.parse_args()
 
     is_zo = args.mode.startswith("zo")
