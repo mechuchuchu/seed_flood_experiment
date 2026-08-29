@@ -1,0 +1,15 @@
+# base_zo.yaml
+mode: zo_adam
+model: resnet20
+lr: 3e-4
+mu: 1e-2
+beta1: 0.999
+beta2: 0.9999
+warmup_rounds: 500
+n_rounds: 3000
+eval_every: 200
+n_nodes: 1
+gpu_resident: true
+precision_probe: true
+curvature_check: true
+bias3_probe: true

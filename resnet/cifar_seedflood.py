@@ -11,20 +11,22 @@ FO baseline + shared-seed ZO (SPSA) + projected-gradient, sign / Adam 모드
                θ±μz 두 지점의 로컬 배치 loss 평가 → 서버가 노드 평균 L̄±로
                scalar=(L̄+−L̄−)/(2μ) → pseudo_grad = mean_q(scalar_q·z_q).
                forward 2Q회, backward 없음.
-  proj_*     : backward 1회로 g를 구한 뒤 s_q = g^T z_q 내적 Q회 → 서버가
-               mean_q(s_q·z_q)로 재구성. 통신은 zo와 동일하게 (seed, 스칼라 Q개)뿐이라
+  proj_*     : backward 1회로 g를 구한 뒤 s = Zg를 한 번에 계산 → 서버가
+               Z^T s/Q로 재구성. 통신은 zo와 동일하게 (seed, 스칼라 Q개)뿐이라
                model size 무관이지만, 노드가 backward를 돌 수 있다고 가정한다.
                μ가 없으므로 곡률/3차항 bias도, 차분의 정밀도 소실도 발생하지 않는다.
 
   세 모드는 같은 통신 예산에서 비교할 수 있어서:
     zo vs proj : μ bias가 성능을 얼마나 깎는지 분리
     proj vs fo : 랜덤 부분공간(Q차원) 사영 자체의 손실만 측정
-  (Q=d면 proj는 g를 완전 복원하므로 fo와 일치한다.)
+  (Gaussian Z이므로 유한 Q에서는 Q=d여도 매 표본에서 g를 완전 복원하지는 않는다.)
 
-- z는 저장하지 않고 seed로 재생성, θ 복원은 스냅샷 copy (zo만; proj는 섭동 없음)
+- 라운드의 z는 (directions, params) flat 행렬로 보관해 내적/재구성을 한 번에 수행
+- θ 복원은 스냅샷 copy (zo만; proj는 섭동 없음)
 - optimizer state(m,v)는 파라미터가 bf16이어도 fp32 master 유지
 
-메모리: train 50000x3x32x32 uint8 ≈ 154MB, test ≈ 31MB (--gpu_resident로 VRAM 상주 가능)
+메모리: 데이터 train ≈154MB, test ≈31MB. 추가로 flat Z가 shared는 Q*d,
+per_node는 N*Q*d 원소를 차지한다 (fp32 ResNet20, Q=64면 약 71MB).
 
 주의(BN vs ZO): BatchNorm은 ±μ 두 번의 forward마다 running stats를 갱신해서 ZO의
 loss 차이 측정을 오염시킴 → --norm auto는 zo/proj 모드에서 GroupNorm을 선택함.
@@ -47,6 +49,7 @@ import torch.nn.functional as F
 
 CIFAR100_MEAN = torch.tensor([0.5071, 0.4865, 0.4409])
 CIFAR100_STD = torch.tensor([0.2673, 0.2564, 0.2762])
+_NORMALIZATION_CACHE = {}
 
 
 def load_cifar100_ram(label_key: str = "fine_label", storage_device: str = "cpu"):
@@ -78,8 +81,14 @@ def load_cifar100_ram(label_key: str = "fine_label", storage_device: str = "cpu"
 
 def normalize(x_uint8: torch.Tensor) -> torch.Tensor:
     """uint8 (B,3,32,32) → normalized float32. 배치 단위로 GPU에서 호출."""
-    mean = CIFAR100_MEAN.to(x_uint8.device).view(1, 3, 1, 1)
-    std = CIFAR100_STD.to(x_uint8.device).view(1, 3, 1, 1)
+    # 매 배치마다 작은 CPU tensor를 GPU로 복사하지 않도록 device별로 재사용한다.
+    key = (x_uint8.device.type, x_uint8.device.index)
+    if key not in _NORMALIZATION_CACHE:
+        _NORMALIZATION_CACHE[key] = (
+            CIFAR100_MEAN.to(x_uint8.device).view(1, 3, 1, 1),
+            CIFAR100_STD.to(x_uint8.device).view(1, 3, 1, 1),
+        )
+    mean, std = _NORMALIZATION_CACHE[key]
     return (x_uint8.float() / 255.0 - mean) / std
 
 
@@ -474,23 +483,51 @@ def train_fo(model, data, device, args, logger):
 
 def zo_gen_dtype(p):
     """z 생성용 dtype: 파라미터가 fp64면 fp64, 그 외(fp32/bf16)는 fp32.
-    bf16에서 직접 randn을 뽑지 않는 이유: perturb와 update가 같은 z를 재생성해야
-    하는데, 생성/스케일링을 fp32 경로로 고정해두면 dtype별 RNG 구현 차이에서 자유로움."""
+    bf16에서 직접 randn을 뽑지 않아 방향 저장과 행렬 연산의 정밀도를 유지한다."""
     return torch.float64 if p.dtype == torch.float64 else torch.float32
 
 
+class FlatDirections:
+    """Q개의 random direction을 contiguous (Q, d) 행렬로 보관한다.
+
+    행 단위 생성 시 parameter-shaped view를 순서대로 채워 기존 seed replay 규칙을
+    유지한다. 내적과 gradient 재구성은 각각 Z@g, Z.T@s 한 번으로 처리한다.
+    """
+
+    def __init__(self, params, capacity):
+        self.params = params
+        self.numels = [p.numel() for p in params]
+        self.dtype = zo_gen_dtype(params[0])
+        self.data = torch.empty(
+            (capacity, sum(self.numels)), device=params[0].device, dtype=self.dtype
+        )
+
+    def fill_(self, seeds, device):
+        directions = self.data[:len(seeds)]
+        for row, seed in zip(directions, seeds):
+            generator = torch.Generator(device=device).manual_seed(seed)
+            for view in self.views(row):
+                view.normal_(generator=generator)
+        return directions
+
+    def views(self, flat):
+        return [chunk.view_as(p) for chunk, p in zip(flat.split(self.numels), self.params)]
+
+
+def draw_seeds(count):
+    """query마다 scalar를 꺼내지 않고 seed들을 한 번에 생성한다."""
+    return torch.randint(0, 2**31 - 1, (count,)).tolist()
+
+
 @torch.no_grad()
-def zo_perturb_(params, seed, scale, device):
-    """seed로 z를 재생성하며 in-place perturb. z 저장 안 함.
-    _foreach_로 묶어서 텐서 수만큼의 개별 커널 launch를 피한다."""
-    g = torch.Generator(device=device).manual_seed(seed)
-    zs = [torch.randn(p.shape, generator=g, device=device, dtype=zo_gen_dtype(p))
-          for p in params]
+def zo_perturb_(params, direction_views, scale):
+    """flat direction의 parameter-shaped view로 in-place perturb한다."""
+    zs = direction_views
     if all(z.dtype == p.dtype for z, p in zip(zs, params)):
         torch._foreach_add_(params, zs, alpha=scale)
     else:  # bf16 파라미터: fp32에서 스케일 후 캐스팅
-        torch._foreach_mul_(zs, scale)
-        torch._foreach_add_(params, [z.to(p.dtype) for z, p in zip(zs, params)])
+        scaled = torch._foreach_mul(zs, scale)
+        torch._foreach_add_(params, [z.to(p.dtype) for z, p in zip(scaled, params)])
 
 
 @torch.no_grad()
@@ -506,11 +543,11 @@ def zo_loss(model, batches):
 
 
 @torch.no_grad()
-def precision_probe(model, params, theta, batches, seed, mu, device, bias3=False):
+def precision_probe(model, params, theta, batches, direction, mu, bias3=False):
     """같은 θ / 같은 z / 같은 배치에서 L0, L±μ (옵션: L±μ/2)를 fp64로 재측정.
 
     - 호출 시점 조건: θ가 스냅샷(theta)으로 복원된 상태
-    - z는 학습 경로와 동일하게 fp32에서 생성 후 fp64로 승격 (같은 방향 보장)
+    - 학습 경로에서 저장한 동일한 flat z를 fp64로 승격 (같은 방향 보장)
     - 반환 dict:
         delta  = L+ − L−            (SPSA 신호)
         dplus  = L+ − L0            (한쪽 차분)
@@ -531,10 +568,9 @@ def precision_probe(model, params, theta, batches, seed, mu, device, bias3=False
     batches64 = [(xb.to(torch.float64), yb) for xb, yb in batches]
 
     def set_perturbed(offset):
-        g = torch.Generator(device=device).manual_seed(seed)
-        for p_, t_ in zip(params64, theta64):
-            z = torch.randn(p_.shape, generator=g, device=device, dtype=torch.float32)
-            p_.data.copy_(t_ + offset * z.double())
+        chunks = direction.split([p.numel() for p in params64])
+        for p_, t_, z_ in zip(params64, theta64, chunks):
+            p_.data.copy_(t_ + offset * z_.view_as(p_).double())
 
     l_zero = zo_loss(model, batches64)  # params64는 아직 θ 그대로
     set_perturbed(+mu)
@@ -563,41 +599,17 @@ def precision_probe(model, params, theta, batches, seed, mu, device, bias3=False
     return out
 
 
-@torch.no_grad()
-def proj_dots(grads, params, seeds, device):
-    """s_q = g^T z_q 를 seed로부터 z를 재생성하며 계산 (z 저장 없음).
-
-    SPSA가 forward 2회로 근사하던 방향미분을, backward 1회로 얻은 g와의 내적으로
-    정확히 구한다. μ가 없으므로 곡률/3차항 bias도, 차분의 정밀도 소실도 없다.
-
-    성능 주의: 누적을 GPU 텐서로 유지하고 seed당 한 번만 float()로 꺼낸다.
-    텐서마다 .item()을 부르면 파라미터 수 × Q 번 파이프라인이 flush돼서
-    작은 모델에서는 이 동기화가 전체 시간을 지배한다.
-    """
-    out = []
-    for sd in seeds:
-        gen = torch.Generator(device=device).manual_seed(sd)
-        zs = [torch.randn(p.shape, generator=gen, device=device, dtype=zo_gen_dtype(p))
-              for p in params]
-        torch._foreach_mul_(zs, grads)
-        acc = torch.zeros((), device=device, dtype=torch.float64)
-        for zi in zs:
-            acc += zi.sum().double()
-        out.append(float(acc))  # seed당 1회만 동기화
-    return out
-
-
 def compute_grad(model, batches, params):
-    """batches 평균 loss의 gradient를 계산해 리스트로 반환 (fp32/fp64 master)."""
+    """batches 평균 loss의 gradient를 contiguous flat vector로 반환."""
     model.zero_grad(set_to_none=True)
-    total = 0.0
+    total = torch.zeros((), device=params[0].device)
     for xb, yb in batches:
         loss = F.cross_entropy(model(xb).float(), yb) / len(batches)
         loss.backward()
-        total += loss.item()
-    g = [p.grad.detach().to(zo_gen_dtype(p)).clone() for p in params]
+        total += loss.detach()
+    g = torch.cat([p.grad.detach().to(zo_gen_dtype(p)).flatten() for p in params])
     model.zero_grad(set_to_none=True)
-    return g, total
+    return g, float(total)
 
 
 def run_fo_warmup(model, data, device, args, logger):
@@ -650,6 +662,10 @@ def train_zo(model, data, device, args, logger):
     params = list(model.parameters())
     dtype = next(model.parameters()).dtype
     node_indices = build_node_indices(x_train.size(0), args.n_nodes, seed=args.data_seed)
+    n_directions = args.n_queries * (args.n_nodes if args.seed_mode == "per_node" else 1)
+    direction_store = FlatDirections(params, n_directions)
+    direction_mb = direction_store.data.numel() * direction_store.data.element_size() / 2**20
+    print(f"[directions] shape={tuple(direction_store.data.shape)}, {direction_mb:.1f} MiB")
 
     # optimizer state는 파라미터가 bf16이어도 fp32 master로 유지
     # (bf16은 mantissa 8bit라 beta1=0.999 같은 계수 자체가 표현이 안 되고,
@@ -677,64 +693,69 @@ def train_zo(model, data, device, args, logger):
             [p.detach().clone() for p in params]
         pdata = [p.data for p in params]  # leaf 제약 없이 in-place 복원용 뷰
 
+        seeds = draw_seeds(n_directions)
+        directions = direction_store.fill_(seeds, device)
+
         if args.mode.startswith("proj"):
-            # ── projected gradient: backward 1회 + 내적 Q회 ──────────────────
+            # ── projected gradient: backward 1회 + batched Z @ g ─────────────
             # 통신은 SPSA와 동일 (seed broadcast + 스칼라 Q개 업로드 → model size 무관)
             # 이지만 노드가 backward를 돌 수 있다고 가정한다. μ가 없어 bias/정밀도
             # 문제가 사라지므로, SPSA와 같은 통신 예산에서 비교하면 μ bias가 성능을
             # 얼마나 깎는지 분리해서 볼 수 있다.
             if args.seed_mode == "shared":
                 g_true, loss_val = compute_grad(model, batches, params)
-                seeds = [int(torch.randint(0, 2**31 - 1, (1,)).item())
-                         for _ in range(args.n_queries)]
-                scalars = proj_dots(g_true, params, seeds, device)
+                scalars_tensor = torch.mv(directions, g_true)
             else:  # per_node: 노드마다 자기 gradient를 자기 seed에 사영
-                seeds, scalars, loss_val = [], [], 0.0
+                scalar_parts, loss_val = [], 0.0
                 g_true = None
-                for nb in batches:
+                for node_index, nb in enumerate(batches):
                     g_i, l_i = compute_grad(model, [nb], params)
-                    sds = [int(torch.randint(0, 2**31 - 1, (1,)).item())
-                           for _ in range(args.n_queries)]
-                    seeds += sds
-                    scalars += proj_dots(g_i, params, sds, device)
+                    start = node_index * args.n_queries
+                    node_directions = directions[start:start + args.n_queries]
+                    scalar_parts.append(torch.mv(node_directions, g_i))
                     loss_val += l_i / len(batches)
+                scalars_tensor = torch.cat(scalar_parts)
+            scalars = scalars_tensor.tolist()  # 모든 query를 한 번의 device sync로 로깅
             l_plus = l_minus = loss_val  # 로그용 (차분이 없으므로 loss 그 자체)
         elif args.seed_mode == "shared":
             # 라운드당 Q개 seed를 전 노드에 broadcast. 모든 노드가 같은 z에서
             # 자기 배치 loss를 평가 → 서버는 노드 평균 L̄±로 scalar 하나를 만든다.
             # Q개 query 전부 같은 배치를 씀 → 배치 노이즈는 공통, z 방향 분산만 1/Q.
-            seeds = [int(torch.randint(0, 2**31 - 1, (1,)).item())
-                     for _ in range(args.n_queries)]
             scalars = []
-            for sd in seeds:
-                zo_perturb_(params, sd, +args.mu, device)
+            for query_index, direction in enumerate(directions):
+                views = direction_store.views(direction)
+                zo_perturb_(params, views, +args.mu)
                 lp = zo_loss(model, batches)
                 torch._foreach_copy_(pdata, theta)
-                zo_perturb_(params, sd, -args.mu, device)
+                zo_perturb_(params, views, -args.mu)
                 lm = zo_loss(model, batches)
                 torch._foreach_copy_(pdata, theta)
                 scalars.append((lp - lm) / (2 * args.mu))
-                if sd is seeds[0]:
+                if query_index == 0:
                     l_plus, l_minus = lp, lm  # probe/로그는 첫 query 기준
         else:  # per_node
             # 노드마다 다른 seed. 각 노드가 자기 z로 자기 배치만 평가 → scalar_i.
             # 서버는 pseudo_grad를 평균: mean_i(scalar_i·z_i).
-            # shared와 달리 각 항의 z가 다르므로 cross term (g_A^T z_B 등)이 노이즈로
-            # 남는다. 노드당 Q개씩 뽑아 총 N·Q 방향 (shared의 Q와 예산이 다름에 주의).
-            seeds, scalars = [], []
+            # 노드마다 다른 random projection을 적용하며, 노드당 Q개씩 뽑아 총 N·Q
+            # 방향을 쓴다 (shared의 Q개와 통신/계산 예산이 다름에 주의).
+            scalars = []
+            direction_index = 0
             for ni_batch in batches:
                 for _ in range(args.n_queries):
-                    sd = int(torch.randint(0, 2**31 - 1, (1,)).item())
-                    zo_perturb_(params, sd, +args.mu, device)
+                    views = direction_store.views(directions[direction_index])
+                    zo_perturb_(params, views, +args.mu)
                     lp = zo_loss(model, [ni_batch])
                     torch._foreach_copy_(pdata, theta)
-                    zo_perturb_(params, sd, -args.mu, device)
+                    zo_perturb_(params, views, -args.mu)
                     lm = zo_loss(model, [ni_batch])
                     torch._foreach_copy_(pdata, theta)
-                    seeds.append(sd)
                     scalars.append((lp - lm) / (2 * args.mu))
-                    if len(seeds) == 1:
+                    if direction_index == 0:
                         l_plus, l_minus = lp, lm
+                    direction_index += 1
+        if args.mode.startswith("zo"):
+            scalars_tensor = torch.tensor(scalars, device=device,
+                                          dtype=direction_store.dtype)
 
         scalar = float(np.mean(scalars))  # 진단/로그용 대표값
         running.append((l_plus + l_minus) / 2)
@@ -764,7 +785,7 @@ def train_zo(model, data, device, args, logger):
             # θ 복원된 지금 시점에 같은 seed/배치로 fp64 재측정 (첫 seed 기준)
             delta_run = l_plus - l_minus
             pr = precision_probe(model, params, theta, probe_batches,
-                                 seeds[0], args.mu, device, bias3=args.bias3_probe)
+                                 directions[0], args.mu, bias3=args.bias3_probe)
             probe.update({
                 "zo_delta": float(f"{delta_run:.6e}"),
                 "zo_delta_fp64": float(f"{pr['delta']:.6e}"),
@@ -777,42 +798,33 @@ def train_zo(model, data, device, args, logger):
                     "zo_grad_term": float(f"{pr['grad_term']:.6e}"),
                 })
 
-        # update: 같은 seed들로 z 재생성 → pseudo_grad = mean_q(scalar_q · z_q)
-        # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
-        # update: 같은 seed들로 z 재생성 → pseudo_grad = mean_q(scalar_q · z_q)
-        # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
-        # _foreach_로 파라미터 리스트를 통째로 처리해 커널 launch 수를 줄인다.
+        # 한 번의 matrix-vector product로 pseudo_grad = Z.T @ scalars / Q.
         want_cos = (args.mode.startswith("proj") and is_eval_round
                     and args.seed_mode == "shared")
         with torch.no_grad():
             if args.zo_weight_decay > 0:
                 torch._foreach_mul_(params, 1 - cur_lr * args.zo_weight_decay)
 
-            grads = [torch.zeros(p.shape, device=device, dtype=zo_gen_dtype(p))
-                     for p in params]
-            for q, sd in enumerate(seeds):
-                gen = torch.Generator(device=device).manual_seed(sd)
-                zs = [torch.randn(p.shape, generator=gen, device=device,
-                                  dtype=zo_gen_dtype(p)) for p in params]
-                torch._foreach_add_(grads, zs, alpha=scalars[q] / len(seeds))
+            pseudo_flat = torch.mv(directions.t(), scalars_tensor).div_(len(seeds))
+            pseudo_grad = direction_store.views(pseudo_flat)
 
             if want_cos:  # 재구성된 방향이 진짜 gradient와 얼마나 정렬됐나
-                dots = torch._foreach_mul(grads, g_true)
-                cos_dot = float(sum(t.sum().double() for t in dots))
-                cos_pn = math.sqrt(float(sum((t * t).sum().double() for t in grads)))
-                gn = math.sqrt(float(sum((t * t).sum().double() for t in g_true)))
+                cos_dot = float(torch.dot(pseudo_flat, g_true).double())
+                cos_pn = float(torch.linalg.vector_norm(pseudo_flat).double())
+                gn = float(torch.linalg.vector_norm(g_true).double())
                 denom = cos_pn * gn
                 probe["proj_cosine"] = round(cos_dot / denom, 6) if denom > 0 else None
                 probe["proj_grad_norm"] = float(f"{gn:.6e}")
 
             if args.mode.endswith("_sign"):
-                steps = torch._foreach_sign(grads)
+                steps = torch._foreach_sign(pseudo_grad)
                 torch._foreach_mul_(steps, cur_lr)
             else:  # Adam
                 torch._foreach_mul_(m, args.beta1)
-                torch._foreach_add_(m, grads, alpha=1 - args.beta1)
+                torch._foreach_add_(m, pseudo_grad, alpha=1 - args.beta1)
                 torch._foreach_mul_(v, args.beta2)
-                torch._foreach_addcmul_(v, grads, grads, value=1 - args.beta2)
+                torch._foreach_addcmul_(v, pseudo_grad, pseudo_grad,
+                                        value=1 - args.beta2)
                 bc1 = 1 - args.beta1 ** rnd
                 bc2 = 1 - args.beta2 ** rnd
                 denom_t = torch._foreach_sqrt(v)
@@ -907,8 +919,8 @@ if __name__ == "__main__":
     p.add_argument("--mode", default="fo",
                    choices=["fo", "zo_sign", "zo_adam", "proj_adam", "proj_sign"],
                    help="fo: 일반 backprop. zo_*: SPSA (forward 2Q회, μ 필요). "
-                        "proj_*: backward 1회로 g를 구한 뒤 s_q=g^T z_q 내적 Q회 → "
-                        "서버가 mean_q(s_q·z_q)로 재구성. 통신량은 zo와 동일하지만 "
+                        "proj_*: backward 1회로 g를 구한 뒤 s=Zg, g_hat=Z^T s/Q를 "
+                        "행렬 연산으로 계산. 통신량은 zo와 동일하지만 "
                         "μ가 없어 곡률/3차항 bias와 차분 정밀도 소실이 사라짐")
     p.add_argument("--model", default="resnet20", choices=list(MODELS))
     p.add_argument("--norm", default="auto", choices=["auto", "batch", "group"],
