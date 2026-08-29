@@ -1,5 +1,5 @@
 # SeedFlood ZO base config (CLI 인자가 이 값들을 override함)
-mode: zo_adam
+mode: zo_sign
 model: resnet20
 dtype: fp32
 norm: group
