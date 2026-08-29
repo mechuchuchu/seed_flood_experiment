@@ -1,0 +1,258 @@
+{
+  "args": {
+    "config": null,
+    "mode": "zo_adam",
+    "model": "resnet20",
+    "norm": "group",
+    "dtype": "fp32",
+    "lr": 0.0003,
+    "warmup_rounds": 500,
+    "lr_schedule": "constant",
+    "batch_size": 128,
+    "n_rounds": 20000,
+    "eval_every": 1000,
+    "weight_decay": 0.0005,
+    "mu": 0.01,
+    "beta1": 0.999,
+    "beta2": 0.9999,
+    "eps": 1e-08,
+    "zo_weight_decay": 0.0,
+    "precision_probe": false,
+    "bias3_probe": false,
+    "curvature_check": false,
+    "n_nodes": 1,
+    "act": "silu",
+    "init": "default",
+    "init_gain": 1.0,
+    "fc_scale": 1.0,
+    "zero_init_residual": false,
+    "fo_warmup_steps": 0,
+    "fo_warmup_lr": 0.05,
+    "early_abort": true,
+    "abort_min_round": 1000,
+    "abort_ratio": 100.0,
+    "augment": "auto",
+    "label_key": "fine_label",
+    "gpu_resident": true,
+    "data_seed": 0,
+    "torch_seed": null,
+    "out": "results/zo_adam_resnet20_fp32_lr0.0003_mu0.01_b10.999_b20.9999_wd0_bs128_n1_r20000_wu500_silu.json",
+    "use_augment": false
+  },
+  "n_params": 278324,
+  "started_at": "2026-08-29 10:46:37",
+  "history": [
+    {
+      "round": 1000,
+      "train_avg": 4.677783,
+      "test_loss": 4.648909,
+      "test_acc": 0.0098,
+      "lr": 0.0003,
+      "elapsed": 34.4,
+      "zo_signal_med": 0.8636951,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 2000,
+      "train_avg": 4.650843,
+      "test_loss": 4.638524,
+      "test_acc": 0.0088,
+      "lr": 0.0003,
+      "elapsed": 68.4,
+      "zo_signal_med": 0.7065296,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 3000,
+      "train_avg": 4.641486,
+      "test_loss": 4.631114,
+      "test_acc": 0.01,
+      "lr": 0.0003,
+      "elapsed": 102.3,
+      "zo_signal_med": 0.6971002,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 4000,
+      "train_avg": 4.635187,
+      "test_loss": 4.624942,
+      "test_acc": 0.0115,
+      "lr": 0.0003,
+      "elapsed": 136.3,
+      "zo_signal_med": 0.6229997,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 5000,
+      "train_avg": 4.629183,
+      "test_loss": 4.62188,
+      "test_acc": 0.0133,
+      "lr": 0.0003,
+      "elapsed": 170.2,
+      "zo_signal_med": 0.6312609,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 6000,
+      "train_avg": 4.627156,
+      "test_loss": 4.618658,
+      "test_acc": 0.0122,
+      "lr": 0.0003,
+      "elapsed": 204.1,
+      "zo_signal_med": 0.6412864,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 7000,
+      "train_avg": 4.623986,
+      "test_loss": 4.616503,
+      "test_acc": 0.0101,
+      "lr": 0.0003,
+      "elapsed": 238.1,
+      "zo_signal_med": 0.5940914,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 8000,
+      "train_avg": 4.61995,
+      "test_loss": 4.613014,
+      "test_acc": 0.0103,
+      "lr": 0.0003,
+      "elapsed": 272.1,
+      "zo_signal_med": 0.5757332,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 9000,
+      "train_avg": 4.617353,
+      "test_loss": 4.611667,
+      "test_acc": 0.0101,
+      "lr": 0.0003,
+      "elapsed": 306.5,
+      "zo_signal_med": 0.5823493,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 10000,
+      "train_avg": 4.616832,
+      "test_loss": 4.609852,
+      "test_acc": 0.0104,
+      "lr": 0.0003,
+      "elapsed": 340.3,
+      "zo_signal_med": 0.6076097,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 11000,
+      "train_avg": 4.614356,
+      "test_loss": 4.608298,
+      "test_acc": 0.01,
+      "lr": 0.0003,
+      "elapsed": 374.2,
+      "zo_signal_med": 0.5352974,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 12000,
+      "train_avg": 4.614514,
+      "test_loss": 4.608057,
+      "test_acc": 0.0093,
+      "lr": 0.0003,
+      "elapsed": 408.1,
+      "zo_signal_med": 0.5614638,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 13000,
+      "train_avg": 4.612464,
+      "test_loss": 4.607559,
+      "test_acc": 0.0101,
+      "lr": 0.0003,
+      "elapsed": 442.0,
+      "zo_signal_med": 0.5887866,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 14000,
+      "train_avg": 4.612492,
+      "test_loss": 4.607652,
+      "test_acc": 0.0093,
+      "lr": 0.0003,
+      "elapsed": 475.9,
+      "zo_signal_med": 0.5548835,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 15000,
+      "train_avg": 4.610962,
+      "test_loss": 4.606708,
+      "test_acc": 0.0097,
+      "lr": 0.0003,
+      "elapsed": 509.9,
+      "zo_signal_med": 0.5687356,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 16000,
+      "train_avg": 4.610307,
+      "test_loss": 4.605716,
+      "test_acc": 0.0117,
+      "lr": 0.0003,
+      "elapsed": 543.7,
+      "zo_signal_med": 0.5496025,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 17000,
+      "train_avg": 4.609464,
+      "test_loss": 4.604372,
+      "test_acc": 0.0129,
+      "lr": 0.0003,
+      "elapsed": 577.6,
+      "zo_signal_med": 0.549078,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 18000,
+      "train_avg": 4.608973,
+      "test_loss": 4.603704,
+      "test_acc": 0.0116,
+      "lr": 0.0003,
+      "elapsed": 611.5,
+      "zo_signal_med": 0.5065441,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 19000,
+      "train_avg": 4.607711,
+      "test_loss": 4.601449,
+      "test_acc": 0.0129,
+      "lr": 0.0003,
+      "elapsed": 646.3,
+      "zo_signal_med": 0.5151987,
+      "zo_signal_zero_frac": 0.0
+    },
+    {
+      "round": 20000,
+      "train_avg": 4.605485,
+      "test_loss": 4.600121,
+      "test_acc": 0.0135,
+      "lr": 0.0003,
+      "elapsed": 680.3,
+      "zo_signal_med": 0.5479932,
+      "zo_signal_zero_frac": 0.0
+    }
+  ],
+  "final": {
+    "test_loss": 4.600121,
+    "test_acc": 0.0135,
+    "total_sec": 680.3,
+    "aborted": null
+  },
+  "init_stats": {
+    "n_params": 278324,
+    "theta_norm": 32.8297,
+    "sqrt_d": 527.5642
+  },
+  "rounds_done": 20000
+}
