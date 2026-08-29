@@ -19,6 +19,7 @@ loss 차이 측정을 오염시킴 → --norm auto는 zo 모드에서 GroupNorm�
 
 import argparse
 import json
+import math
 import os
 import time
 
@@ -216,12 +217,13 @@ class RunLogger:
         self.out = args.out
         os.makedirs(os.path.dirname(self.out) or ".", exist_ok=True)
 
-    def log(self, rnd, train_avg, test_loss, test_acc, elapsed):
+    def log(self, rnd, train_avg, test_loss, test_acc, elapsed, lr=None):
         self.record["history"].append({
             "round": rnd,
             "train_avg": round(float(train_avg), 6),
             "test_loss": round(float(test_loss), 6),
             "test_acc": round(float(test_acc), 6),
+            "lr": round(float(lr), 8) if lr is not None else None,
             "elapsed": round(elapsed, 1),
         })
         self._dump()  # 매 eval마다 저장 → 중간에 죽어도 로그 살아있음
@@ -243,6 +245,21 @@ class RunLogger:
 
 
 # ----------------------------------------------------------------------------
+# LR schedule: linear warmup → constant | cosine
+# ----------------------------------------------------------------------------
+
+
+def lr_at(rnd, args):
+    """rnd(1-indexed)에서의 lr. warmup 구간은 0→lr 선형 증가."""
+    if args.warmup_rounds > 0 and rnd <= args.warmup_rounds:
+        return args.lr * rnd / args.warmup_rounds
+    if args.lr_schedule == "cosine":
+        t = (rnd - args.warmup_rounds) / max(1, args.n_rounds - args.warmup_rounds)
+        return args.lr * 0.5 * (1.0 + math.cos(math.pi * t))
+    return args.lr  # constant
+
+
+# ----------------------------------------------------------------------------
 # FO baseline
 # ----------------------------------------------------------------------------
 
@@ -252,23 +269,24 @@ def train_fo(model, data, device, args, logger):
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
                           weight_decay=args.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.n_rounds)
 
     running, t0 = [], time.time()
     tl = ta = float("nan")
     for step in range(1, args.n_rounds + 1):
+        cur_lr = lr_at(step, args)
+        for grp in opt.param_groups:
+            grp["lr"] = cur_lr
         xb, yb = get_batch(x_train, y_train, args.batch_size, device,
                            augment=args.use_augment)
         loss = F.cross_entropy(model(xb), yb)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        sched.step()
         running.append(loss.item())
         if step % args.eval_every == 0 or step == args.n_rounds:
             tl, ta = evaluate(model, x_test, y_test, device)
             el = time.time() - t0
-            logger.log(step, np.mean(running), tl, ta, el)
+            logger.log(step, np.mean(running), tl, ta, el, lr=cur_lr)
             print(f"step {step:6d} | train_avg {np.mean(running):.4f} | "
                   f"test_loss {tl:.4f} | test_acc {ta:.4f} | {el:.0f}s")
             running = []
@@ -328,6 +346,7 @@ def train_zo(model, data, device, args, logger):
 
         scalar = (l_plus - l_minus) / (2 * args.mu)
         running.append((l_plus + l_minus) / 2)
+        cur_lr = lr_at(rnd, args)
 
         # update: 같은 seed로 z 재생성 → pseudo_grad = scalar·z
         g = torch.Generator(device=device).manual_seed(seed)
@@ -336,18 +355,18 @@ def train_zo(model, data, device, args, logger):
                 z = torch.randn(p.shape, generator=g, device=device, dtype=p.dtype)
                 grad = scalar * z
                 if args.mode == "zo_sign":
-                    p.sub_(args.lr * grad.sign())
+                    p.sub_(cur_lr * grad.sign())
                 else:  # zo_adam
                     m[i].mul_(args.beta1).add_(grad, alpha=1 - args.beta1)
                     v[i].mul_(args.beta2).addcmul_(grad, grad, value=1 - args.beta2)
                     m_hat = m[i] / (1 - args.beta1 ** rnd)
                     v_hat = v[i] / (1 - args.beta2 ** rnd)
-                    p.sub_(args.lr * m_hat / (v_hat.sqrt() + args.eps))
+                    p.sub_(cur_lr * m_hat / (v_hat.sqrt() + args.eps))
 
         if rnd % args.eval_every == 0 or rnd == args.n_rounds:
             tl, ta = evaluate(model, x_test, y_test, device)
             el = time.time() - t0
-            logger.log(rnd, np.mean(running), tl, ta, el)
+            logger.log(rnd, np.mean(running), tl, ta, el, lr=cur_lr)
             print(f"round {rnd:6d} | train_avg {np.mean(running):.4f} | "
                   f"test_loss {tl:.4f} | test_acc {ta:.4f} | {el:.0f}s")
             running = []
@@ -375,6 +394,12 @@ if __name__ == "__main__":
     # 공통 hyperparams
     p.add_argument("--lr", type=float, default=None,
                    help="default: fo=0.1, zo_sign=1e-3, zo_adam=1e-3")
+    p.add_argument("--warmup_rounds", type=int, default=0,
+                   help="0→lr 선형 warmup 구간 길이 (0이면 warmup 없음)")
+    p.add_argument("--lr_schedule", default="auto",
+                   choices=["auto", "constant", "cosine"],
+                   help="warmup 이후 스케줄. auto: fo=cosine, zo=constant "
+                        "(기존 MNIST sweep과 조건 맞추기 위함)")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--n_rounds", type=int, default=3000)
     p.add_argument("--eval_every", type=int, default=200)
@@ -402,6 +427,8 @@ if __name__ == "__main__":
         args.lr = 0.1 if args.mode == "fo" else 1e-3
     if args.norm == "auto":
         args.norm = "group" if is_zo else "batch"
+    if args.lr_schedule == "auto":
+        args.lr_schedule = "constant" if is_zo else "cosine"
     if is_zo and args.norm == "batch":
         print("[warn] zo + BatchNorm: ±μ forward마다 running stats가 갱신되어 "
               "측정이 오염될 수 있음 (--norm group 권장)")
