@@ -1,21 +1,33 @@
 """
 CIFAR-100 (HuggingFace uoft-cs/cifar100) + CIFAR-style ResNet
-FO baseline + shared-seed ZO (SPSA) — sign / Adam 모드
+FO baseline + shared-seed ZO (SPSA) + projected-gradient, sign / Adam 모드
 
 - torchvision 서버 이슈 우회: datasets 라이브러리로 로드
 - 전체 데이터를 uint8 텐서로 RAM(또는 GPU)에 상주, DataLoader 없이 인덱스 샘플링
-- shared-seed SPSA: 라운드당 seed 1개 → 전 노드 같은 z 방향, loss 노드 평균 →
-  scalar = (L+ − L−)/(2μ), pseudo_grad = scalar·z  (mnist_seedflood_sweep.py와 동일 구조)
-- z는 저장하지 않고 seed로 재생성 (±μ perturb 2회 + update 1회), θ 복원은 스냅샷 copy
-  (산술 복원은 bf16에서 rounding 잔차가 μ 스케일로 남음 — 아래 dtype 주의 참고)
-  (zo_adam은 m, v 버퍼로 2x params 추가, fp32/fp64 master)
-- 모든 결과는 json 하나에 저장: args(hyperparams) + round별 시계열 + final
-  → aggregate_results.py에 그대로 물릴 수 있는 flat 구조
+
+[추정기 3종]
+  fo         : 일반 backprop. 비교 기준.
+  zo_*       : shared-seed SPSA. 라운드당 seed Q개 broadcast → 전 노드가 같은 z에서
+               θ±μz 두 지점의 로컬 배치 loss 평가 → 서버가 노드 평균 L̄±로
+               scalar=(L̄+−L̄−)/(2μ) → pseudo_grad = mean_q(scalar_q·z_q).
+               forward 2Q회, backward 없음.
+  proj_*     : backward 1회로 g를 구한 뒤 s_q = g^T z_q 내적 Q회 → 서버가
+               mean_q(s_q·z_q)로 재구성. 통신은 zo와 동일하게 (seed, 스칼라 Q개)뿐이라
+               model size 무관이지만, 노드가 backward를 돌 수 있다고 가정한다.
+               μ가 없으므로 곡률/3차항 bias도, 차분의 정밀도 소실도 발생하지 않는다.
+
+  세 모드는 같은 통신 예산에서 비교할 수 있어서:
+    zo vs proj : μ bias가 성능을 얼마나 깎는지 분리
+    proj vs fo : 랜덤 부분공간(Q차원) 사영 자체의 손실만 측정
+  (Q=d면 proj는 g를 완전 복원하므로 fo와 일치한다.)
+
+- z는 저장하지 않고 seed로 재생성, θ 복원은 스냅샷 copy (zo만; proj는 섭동 없음)
+- optimizer state(m,v)는 파라미터가 bf16이어도 fp32 master 유지
 
 메모리: train 50000x3x32x32 uint8 ≈ 154MB, test ≈ 31MB (--gpu_resident로 VRAM 상주 가능)
 
 주의(BN vs ZO): BatchNorm은 ±μ 두 번의 forward마다 running stats를 갱신해서 ZO의
-loss 차이 측정을 오염시킴 → --norm auto는 zo 모드에서 GroupNorm을 선택함.
+loss 차이 측정을 오염시킴 → --norm auto는 zo/proj 모드에서 GroupNorm을 선택함.
 """
 
 import argparse
@@ -544,6 +556,37 @@ def precision_probe(model, params, theta, batches, seed, mu, device, bias3=False
     return out
 
 
+@torch.no_grad()
+def proj_dots(grads, params, seeds, device):
+    """s_q = g^T z_q 를 seed로부터 z를 재생성하며 계산 (z 저장 없음).
+
+    SPSA가 forward 2회로 근사하던 방향미분을, backward 1회로 얻은 g와의 내적으로
+    정확히 구한다. μ가 없으므로 곡률/3차항 bias도, 차분의 정밀도 소실도 없다.
+    """
+    out = []
+    for sd in seeds:
+        gen = torch.Generator(device=device).manual_seed(sd)
+        s = 0.0
+        for gi, p in zip(grads, params):
+            z = torch.randn(p.shape, generator=gen, device=device, dtype=zo_gen_dtype(p))
+            s += float((gi * z).sum())
+        out.append(s)
+    return out
+
+
+def compute_grad(model, batches, params):
+    """batches 평균 loss의 gradient를 계산해 리스트로 반환 (fp32/fp64 master)."""
+    model.zero_grad(set_to_none=True)
+    total = 0.0
+    for xb, yb in batches:
+        loss = F.cross_entropy(model(xb).float(), yb) / len(batches)
+        loss.backward()
+        total += loss.item()
+    g = [p.grad.detach().to(zo_gen_dtype(p)).clone() for p in params]
+    model.zero_grad(set_to_none=True)
+    return g, total
+
+
 def run_fo_warmup(model, data, device, args, logger):
     """ZO 시작 전 FO(SGD+momentum)로 지정 step만큼 사전 학습.
 
@@ -598,7 +641,7 @@ def train_zo(model, data, device, args, logger):
     # optimizer state는 파라미터가 bf16이어도 fp32 master로 유지
     # (bf16은 mantissa 8bit라 beta1=0.999 같은 계수 자체가 표현이 안 되고,
     #  (1-beta2)=1e-4 스케일 누적이 바로 소실됨)
-    if args.mode == "zo_adam":
+    if not args.mode.endswith("_sign"):
         m = [torch.zeros(p.shape, device=device, dtype=zo_gen_dtype(p)) for p in params]
         v = [torch.zeros(p.shape, device=device, dtype=zo_gen_dtype(p)) for p in params]
 
@@ -616,9 +659,33 @@ def train_zo(model, data, device, args, logger):
 
         # θ 스냅샷 복원 방식: 산술 복원(+μ→−2μ→+μ)은 bf16에서 rounding 잔차가
         # μ와 같은 스케일(~1e-2)로 남아 매 라운드 θ를 오염시킴 → copy로 정확 복원.
-        theta = [p.detach().clone() for p in params]
+        # proj 모드는 파라미터를 섭동하지 않으므로 스냅샷이 필요 없다.
+        theta = None if args.mode.startswith("proj") else \
+            [p.detach().clone() for p in params]
 
-        if args.seed_mode == "shared":
+        if args.mode.startswith("proj"):
+            # ── projected gradient: backward 1회 + 내적 Q회 ──────────────────
+            # 통신은 SPSA와 동일 (seed broadcast + 스칼라 Q개 업로드 → model size 무관)
+            # 이지만 노드가 backward를 돌 수 있다고 가정한다. μ가 없어 bias/정밀도
+            # 문제가 사라지므로, SPSA와 같은 통신 예산에서 비교하면 μ bias가 성능을
+            # 얼마나 깎는지 분리해서 볼 수 있다.
+            if args.seed_mode == "shared":
+                g_true, loss_val = compute_grad(model, batches, params)
+                seeds = [int(torch.randint(0, 2**31 - 1, (1,)).item())
+                         for _ in range(args.n_queries)]
+                scalars = proj_dots(g_true, params, seeds, device)
+            else:  # per_node: 노드마다 자기 gradient를 자기 seed에 사영
+                seeds, scalars, loss_val = [], [], 0.0
+                g_true = None
+                for nb in batches:
+                    g_i, l_i = compute_grad(model, [nb], params)
+                    sds = [int(torch.randint(0, 2**31 - 1, (1,)).item())
+                           for _ in range(args.n_queries)]
+                    seeds += sds
+                    scalars += proj_dots(g_i, params, sds, device)
+                    loss_val += l_i / len(batches)
+            l_plus = l_minus = loss_val  # 로그용 (차분이 없으므로 loss 그 자체)
+        elif args.seed_mode == "shared":
             # 라운드당 Q개 seed를 전 노드에 broadcast. 모든 노드가 같은 z에서
             # 자기 배치 loss를 평가 → 서버는 노드 평균 L̄±로 scalar 하나를 만든다.
             # Q개 query 전부 같은 배치를 씀 → 배치 노이즈는 공통, z 방향 분산만 1/Q.
@@ -703,6 +770,9 @@ def train_zo(model, data, device, args, logger):
         # update: 같은 seed들로 z 재생성 → pseudo_grad = mean_q(scalar_q · z_q)
         # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
         gens = [torch.Generator(device=device).manual_seed(sd) for sd in seeds]
+        want_cos = (args.mode.startswith("proj") and is_eval_round
+                    and args.seed_mode == "shared")
+        cos_dot = cos_pn = 0.0
         with torch.no_grad():
             for i, p in enumerate(params):
                 if args.zo_weight_decay > 0:
@@ -712,14 +782,22 @@ def train_zo(model, data, device, args, logger):
                 for q, gen in enumerate(gens):
                     z = torch.randn(p.shape, generator=gen, device=device, dtype=gdt)
                     grad.add_(z, alpha=scalars[q] / len(gens))
-                if args.mode == "zo_sign":
+                if want_cos:  # 재구성된 방향이 진짜 gradient와 얼마나 정렬됐나
+                    cos_dot += float((grad * g_true[i]).sum())
+                    cos_pn += float((grad * grad).sum())
+                if args.mode.endswith("_sign"):
                     p.sub_((cur_lr * grad.sign()).to(p.dtype))
-                else:  # zo_adam
+                else:
                     m[i].mul_(args.beta1).add_(grad, alpha=1 - args.beta1)
                     v[i].mul_(args.beta2).addcmul_(grad, grad, value=1 - args.beta2)
                     m_hat = m[i] / (1 - args.beta1 ** rnd)
                     v_hat = v[i] / (1 - args.beta2 ** rnd)
                     p.sub_((cur_lr * m_hat / (v_hat.sqrt() + args.eps)).to(p.dtype))
+        if want_cos:
+            gn = math.sqrt(sum(float((gi * gi).sum()) for gi in g_true))
+            denom = math.sqrt(cos_pn) * gn
+            probe["proj_cosine"] = round(cos_dot / denom, 6) if denom > 0 else None
+            probe["proj_grad_norm"] = float(f"{gn:.6e}")
 
         if is_eval_round:
             tl, ta = evaluate(model, x_test, y_test, device)
@@ -750,8 +828,9 @@ def train_zo(model, data, device, args, logger):
 def default_out(args):
     """조합을 파일명으로 인코딩 (aggregate 시 파일명만으로 조건 식별 가능하게).
     zo_weight_decay는 zo 모드, weight_decay는 fo 모드에서만 붙임."""
-    wd = args.zo_weight_decay if args.mode.startswith("zo") else args.weight_decay
-    tag = (f"{args.mode}_{args.model}_{args.dtype}_lr{args.lr:g}_mu{args.mu:g}"
+    wd = args.zo_weight_decay if args.mode.startswith(("zo", "proj")) else args.weight_decay
+    mu_tag = "" if args.mode.startswith(("fo", "proj")) else f"_mu{args.mu:g}"
+    tag = (f"{args.mode}_{args.model}_{args.dtype}_lr{args.lr:g}{mu_tag}"
            f"_b1{args.beta1:g}_b2{args.beta2:g}_wd{wd:g}"
            f"_bs{args.batch_size}_n{args.n_nodes}_r{args.n_rounds}")
     if args.n_queries > 1:
@@ -797,7 +876,12 @@ if __name__ == "__main__":
                    help="yaml 설정 파일. 여기 적힌 값이 default가 되고, "
                         "CLI로 준 인자가 그걸 override함 (grid sweep 시 "
                         "--config base.yaml --mu 2.5e-3 식으로 사용)")
-    p.add_argument("--mode", default="fo", choices=["fo", "zo_sign", "zo_adam"])
+    p.add_argument("--mode", default="fo",
+                   choices=["fo", "zo_sign", "zo_adam", "proj_adam", "proj_sign"],
+                   help="fo: 일반 backprop. zo_*: SPSA (forward 2Q회, μ 필요). "
+                        "proj_*: backward 1회로 g를 구한 뒤 s_q=g^T z_q 내적 Q회 → "
+                        "서버가 mean_q(s_q·z_q)로 재구성. 통신량은 zo와 동일하지만 "
+                        "μ가 없어 곡률/3차항 bias와 차분 정밀도 소실이 사라짐")
     p.add_argument("--model", default="resnet20", choices=list(MODELS))
     p.add_argument("--norm", default="auto", choices=["auto", "batch", "group"],
                    help="auto: fo→batch, zo→group (BN running stats 오염 회피)")
@@ -900,13 +984,16 @@ if __name__ == "__main__":
         print(f"[config] {pre.config}: {len(cfg)} keys loaded")
     args = p.parse_args()
 
-    is_zo = args.mode.startswith("zo")
+    is_zo = args.mode.startswith("zo")       # SPSA (μ 차분)
+    is_proj = args.mode.startswith("proj")   # backward + 랜덤 사영
+    is_dist = is_zo or is_proj               # 분산 추정기 계열 (train_zo가 처리)
     if args.lr is None:
         args.lr = 0.1 if args.mode == "fo" else 1e-3
     if args.norm == "auto":
-        args.norm = "group" if is_zo else "batch"
+        # proj도 group으로: zo와 같은 아키텍처여야 공정 비교가 됨
+        args.norm = "group" if is_dist else "batch"
     if args.lr_schedule == "auto":
-        args.lr_schedule = "constant" if is_zo else "cosine"
+        args.lr_schedule = "constant" if is_dist else "cosine"
     if is_zo and args.norm == "batch":
         print("[warn] zo + BatchNorm: ±μ forward마다 running stats가 갱신되어 "
               "측정이 오염될 수 있음 (--norm group 권장)")
@@ -914,16 +1001,16 @@ if __name__ == "__main__":
         print("[warn] --precision_probe는 fp64 런에서 무의미 (자기 자신과 비교) → 비활성")
         args.precision_probe = False
     if args.precision_probe and not is_zo:
-        print("[warn] --precision_probe는 zo 모드 전용 → 비활성")
+        print("[warn] --precision_probe는 zo(SPSA) 모드 전용 → 비활성")
         args.precision_probe = False
-    if args.fo_warmup_steps > 0 and not is_zo:
-        print("[warn] --fo_warmup_steps는 zo 모드 전용 → 무시")
+    if args.fo_warmup_steps > 0 and not is_dist:
+        print("[warn] --fo_warmup_steps는 zo/proj 모드 전용 → 무시")
         args.fo_warmup_steps = 0
     if args.bias3_probe and not args.precision_probe:
         print("[info] --bias3_probe는 --precision_probe를 필요로 함 → 함께 활성화")
         args.precision_probe = is_zo
     if args.curvature_check and not is_zo:
-        print("[warn] --curvature_check는 zo 모드 전용 → 비활성")
+        print("[warn] --curvature_check는 zo(SPSA) 모드 전용 → 비활성")
         args.curvature_check = False
     args.use_augment = (args.mode == "fo") if args.augment == "auto" else (args.augment == "on")
     if args.out is None:
