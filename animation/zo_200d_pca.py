@@ -260,6 +260,6 @@ anim = animation.FuncAnimation(fig, update, init_func=init,
                                frames=N_FRAMES, interval=1000 / 20, blit=True)
 plt.tight_layout()
 
-out_path = "/home/claude/zo_pca_200d.mp4"
+out_path = "./zo_pca_200d.mp4"
 anim.save(out_path, writer=animation.FFMpegWriter(fps=20, bitrate=2600), dpi=140)
 print(f"[viz] saved -> {out_path}")
