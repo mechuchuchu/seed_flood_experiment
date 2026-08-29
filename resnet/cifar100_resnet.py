@@ -334,14 +334,16 @@ def zo_loss(model, batches):
 
 @torch.no_grad()
 def precision_probe(model, params, theta, batches, seed, mu, device):
-    """같은 θ / 같은 z / 같은 배치에서 ΔL = L+ − L− 를 fp64 ground truth로 재측정.
+    """같은 θ / 같은 z / 같은 배치에서 L0, L+, L− 를 fp64 ground truth로 재측정.
 
     - 호출 시점 조건: θ가 스냅샷(theta)으로 복원된 상태
     - z는 학습 경로와 동일하게 fp32에서 생성 후 fp64로 승격 (같은 방향 보장)
     - 입력 배치는 이미 캐스팅된 텐서를 fp64로 승격 → compute 정밀도만 분리해서 측정
-      (입력 양자화 효과는 L+/L− 양쪽에 동일하게 들어가 ΔL에서 거의 상쇄됨)
-    - 반환: fp64에서의 (L+ − L−). 실행 dtype에서의 값과 비교하면 그 시점의
-      측정 노이즈 바닥을 알 수 있음
+    - 반환 dict:
+        delta  = L+ − L−            (SPSA 신호)
+        dplus  = L+ − L0            (한쪽 차분)
+        dminus = L0 − L−            (반대쪽 차분)
+        curv   = dplus − dminus     (= L+ + L− − 2L0 ≈ μ²·zᵀHz, 선형근사 위반량)
     """
     orig_dtype = next(model.parameters()).dtype
     model.double()
@@ -355,6 +357,7 @@ def precision_probe(model, params, theta, batches, seed, mu, device):
             z = torch.randn(p_.shape, generator=g, device=device, dtype=torch.float32)
             p_.data.copy_(t_ + sign * mu * z.double())
 
+    l_zero = zo_loss(model, batches64)  # params64는 아직 θ 그대로
     set_perturbed(+1)
     l_plus = zo_loss(model, batches64)
     set_perturbed(-1)
@@ -364,7 +367,9 @@ def precision_probe(model, params, theta, batches, seed, mu, device):
     model.to(orig_dtype)
     for p_, t_ in zip(model.parameters(), theta):
         p_.data.copy_(t_)
-    return l_plus - l_minus
+    dplus, dminus = l_plus - l_zero, l_zero - l_minus
+    return {"delta": l_plus - l_minus, "dplus": dplus, "dminus": dminus,
+            "curv": dplus - dminus}
 
 
 def train_zo(model, data, device, args, logger):
@@ -412,16 +417,27 @@ def train_zo(model, data, device, args, logger):
 
         is_eval_round = (rnd % args.eval_every == 0 or rnd == args.n_rounds)
         probe = {}
+        if args.curvature_check and is_eval_round:
+            # 대칭성 검증: (L+ − L0) =? (L0 − L−). 차이 = L+ + L− − 2L0 ≈ μ²·zᵀHz
+            # θ는 지금 복원된 상태이므로 무섭동 loss를 같은 배치로 한 번 더 측정
+            l_zero = zo_loss(model, batches)
+            dplus, dminus = l_plus - l_zero, l_zero - l_minus
+            probe.update({
+                "zo_dplus": float(f"{dplus:.6e}"),
+                "zo_dminus": float(f"{dminus:.6e}"),
+                "zo_curv": float(f"{dplus - dminus:.6e}"),
+            })
         if args.precision_probe and is_eval_round:
             # θ 복원된 지금 시점에 같은 seed/배치로 fp64 재측정
             delta_run = l_plus - l_minus
-            delta_fp64 = precision_probe(model, params, theta, batches,
-                                         seed, args.mu, device)
-            probe = {
+            pr = precision_probe(model, params, theta, batches,
+                                 seed, args.mu, device)
+            probe.update({
                 "zo_delta": float(f"{delta_run:.6e}"),
-                "zo_delta_fp64": float(f"{delta_fp64:.6e}"),
-                "zo_delta_err": float(f"{delta_run - delta_fp64:.6e}"),
-            }
+                "zo_delta_fp64": float(f"{pr['delta']:.6e}"),
+                "zo_delta_err": float(f"{delta_run - pr['delta']:.6e}"),
+                "zo_curv_fp64": float(f"{pr['curv']:.6e}"),
+            })
 
         # update: 같은 seed로 z 재생성 → pseudo_grad = scalar·z
         # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
@@ -497,8 +513,12 @@ if __name__ == "__main__":
                         "pseudo_grad에 더하지 않으므로 m/v 통계를 오염시키지 않음")
     p.add_argument("--precision_probe", action="store_true",
                    help="eval마다 같은 θ/z/배치로 ΔL을 fp64 재측정해서 "
-                        "zo_delta / zo_delta_fp64 / zo_delta_err를 history에 기록 "
-                        "(측정 노이즈 바닥 추적, ZO 모드 전용)")
+                        "zo_delta / zo_delta_fp64 / zo_delta_err / zo_curv_fp64를 "
+                        "history에 기록 (측정 노이즈 바닥 추적, ZO 모드 전용)")
+    p.add_argument("--curvature_check", action="store_true",
+                   help="eval마다 무섭동 L0도 측정해서 (L+−L0) vs (L0−L−) 대칭성 검증. "
+                        "zo_dplus / zo_dminus / zo_curv(=μ²·zᵀHz 추정) 기록 "
+                        "(SPSA 선형근사 위반 = mu bias 추적, ZO 모드 전용)")
     p.add_argument("--n_nodes", type=int, default=1)
     # misc
     p.add_argument("--augment", default="auto", choices=["auto", "on", "off"],
@@ -528,6 +548,9 @@ if __name__ == "__main__":
     if args.precision_probe and not is_zo:
         print("[warn] --precision_probe는 zo 모드 전용 → 비활성")
         args.precision_probe = False
+    if args.curvature_check and not is_zo:
+        print("[warn] --curvature_check는 zo 모드 전용 → 비활성")
+        args.curvature_check = False
     args.use_augment = (args.mode == "fo") if args.augment == "auto" else (args.augment == "on")
     if args.out is None:
         args.out = default_out(args)
