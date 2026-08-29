@@ -206,6 +206,82 @@ MODELS = {"resnet20": resnet20, "resnet18": resnet18}
 
 
 # ----------------------------------------------------------------------------
+# Parameter initialization
+# ----------------------------------------------------------------------------
+
+
+def init_model(model, scheme="default", gain=1.0, fc_scale=1.0, zero_init_residual=False):
+    """Conv/Linear weight 초기화 스킴 적용.
+
+    scheme:
+      default        : PyTorch 기본 (Conv2d/Linear 모두 kaiming_uniform, a=√5
+                       → 사실상 gain이 작은 uniform. 아래 kaiming_*와 다름)
+      kaiming_normal : He normal, fan_out + relu (ResNet 논문 표준)
+      kaiming_uniform: He uniform, fan_out + relu
+      xavier_normal  : Glorot normal
+      xavier_uniform : Glorot uniform
+      orthogonal     : 직교 초기화 (fan-in 축 기준 reshape)
+
+    gain: 위 스킴으로 초기화한 weight 전체에 곱하는 스케일.
+          ZO에서 perturbation ‖μz‖=μ√d 대비 ‖θ‖ 비율을 조절하고 싶을 때 사용.
+    fc_scale: 마지막 분류기(fc) weight에만 추가로 곱하는 스케일.
+          작게 주면 초기 로짓이 작아져 softmax가 균등에 가까워지고, 크게 주면 반대.
+    zero_init_residual: 각 BasicBlock의 두 번째 norm weight를 0으로 → 블록이 항등함수로
+          시작 (Goyal et al. 2017). 깊은 net에서 초기 신호 전파 안정화.
+    """
+    norm_types = (nn.BatchNorm2d, nn.GroupNorm)
+    if scheme != "default":
+        for mod in model.modules():
+            if isinstance(mod, (nn.Conv2d, nn.Linear)):
+                w = mod.weight
+                if scheme == "kaiming_normal":
+                    nn.init.kaiming_normal_(w, mode="fan_out", nonlinearity="relu")
+                elif scheme == "kaiming_uniform":
+                    nn.init.kaiming_uniform_(w, mode="fan_out", nonlinearity="relu")
+                elif scheme == "xavier_normal":
+                    nn.init.xavier_normal_(w)
+                elif scheme == "xavier_uniform":
+                    nn.init.xavier_uniform_(w)
+                elif scheme == "orthogonal":
+                    nn.init.orthogonal_(w)
+                else:
+                    raise ValueError(f"unknown init scheme: {scheme}")
+                if mod.bias is not None:
+                    nn.init.zeros_(mod.bias)
+        for mod in model.modules():  # norm affine은 스킴과 무관하게 표준값 유지
+            if isinstance(mod, norm_types) and mod.weight is not None:
+                nn.init.ones_(mod.weight)
+                nn.init.zeros_(mod.bias)
+
+    if gain != 1.0:
+        with torch.no_grad():
+            for mod in model.modules():
+                if isinstance(mod, (nn.Conv2d, nn.Linear)):
+                    mod.weight.mul_(gain)
+
+    if fc_scale != 1.0:
+        with torch.no_grad():
+            model.fc.weight.mul_(fc_scale)
+            if model.fc.bias is not None:
+                model.fc.bias.mul_(fc_scale)
+
+    if zero_init_residual:
+        for mod in model.modules():
+            if isinstance(mod, BasicBlock) and mod.n2.weight is not None:
+                nn.init.zeros_(mod.n2.weight)
+
+    return model
+
+
+def param_stats(model):
+    """초기화 결과 요약 (ZO에서 ‖θ‖ 대비 perturbation 크기 감 잡기용)."""
+    with torch.no_grad():
+        sq = sum((p.double() ** 2).sum() for p in model.parameters())
+        d = sum(p.numel() for p in model.parameters())
+    return {"n_params": d, "theta_norm": float(sq.sqrt()), "sqrt_d": math.sqrt(d)}
+
+
+# ----------------------------------------------------------------------------
 # Logging: hyperparams + 시계열 → json
 # ----------------------------------------------------------------------------
 
@@ -572,6 +648,12 @@ def default_out(args):
         tag += f"_wu{args.warmup_rounds}"
     if args.lr_schedule != "constant":
         tag += f"_{args.lr_schedule}"
+    if args.init != "default":
+        tag += f"_{args.init}"
+    if args.init_gain != 1.0:
+        tag += f"_g{args.init_gain:g}"
+    if args.fc_scale != 1.0:
+        tag += f"_fc{args.fc_scale:g}"
     return os.path.join("results", tag + ".json")
 
 
@@ -639,6 +721,17 @@ if __name__ == "__main__":
                         "zo_dplus / zo_dminus / zo_curv(=μ²·zᵀHz 추정) 기록 "
                         "(SPSA 선형근사 위반 = mu bias 추적, ZO 모드 전용)")
     p.add_argument("--n_nodes", type=int, default=1)
+    p.add_argument("--init", default="default",
+                   choices=["default", "kaiming_normal", "kaiming_uniform",
+                            "xavier_normal", "xavier_uniform", "orthogonal"],
+                   help="Conv/Linear weight 초기화 스킴")
+    p.add_argument("--init_gain", type=float, default=1.0,
+                   help="초기화된 weight 전체에 곱하는 스케일 (‖θ‖ 조절)")
+    p.add_argument("--fc_scale", type=float, default=1.0,
+                   help="마지막 fc weight에만 추가로 곱하는 스케일 "
+                        "(<1이면 초기 로짓이 작아짐)")
+    p.add_argument("--zero_init_residual", action="store_true",
+                   help="각 블록의 두 번째 norm weight를 0으로 → 블록이 항등함수로 시작")
     p.add_argument("--early_abort", action="store_true",
                    help="|g^T z| 신호가 초기 대비 붕괴하고 loss가 uniform(ln C) 근처에 "
                         "머물면 조기 종료 (grid sweep에서 죽은 조합 낭비 방지)")
@@ -700,13 +793,26 @@ if __name__ == "__main__":
     num_classes = 100 if args.label_key == "fine_label" else 20
     DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp64": torch.float64}
     model = MODELS[args.model](num_classes=num_classes, norm=args.norm)
+    model = init_model(model, scheme=args.init, gain=args.init_gain,
+                       fc_scale=args.fc_scale,
+                       zero_init_residual=args.zero_init_residual)
     model = model.to(device=device, dtype=DTYPES[args.dtype])
-    n_params = sum(par.numel() for par in model.parameters())
-    print(f"[model] {args.model} ({args.norm} norm, {args.dtype}): "
+    stats = param_stats(model)
+    n_params = stats["n_params"]
+    print(f"[model] {args.model} ({args.norm} norm, {args.dtype}, init={args.init}"
+          f"{f'×{args.init_gain:g}' if args.init_gain != 1.0 else ''}): "
           f"{n_params / 1e6:.2f}M params, mode={args.mode}, device={device}")
+    if is_zo:
+        # ZO 감각 잡기용: perturbation 크기 ‖μz‖ ≈ μ√d 와 ‖θ‖ 비교
+        pert = args.mu * stats["sqrt_d"]
+        print(f"[zo] ||theta||={stats['theta_norm']:.2f}  mu*sqrt(d)={pert:.2f}  "
+              f"ratio={pert / stats['theta_norm']:.3f}"
+              + ("  <- perturbation이 theta 대비 큼 (선형근사 의심)"
+                 if pert / stats["theta_norm"] > 0.05 else ""))
     print(f"[out] {args.out}")
 
     logger = RunLogger(args, n_params)
+    logger.record["init_stats"] = {k: round(v, 4) for k, v in stats.items()}
     if args.mode == "fo":
         train_fo(model, data, device, args, logger)
     else:
