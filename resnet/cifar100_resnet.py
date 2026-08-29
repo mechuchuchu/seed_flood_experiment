@@ -352,6 +352,8 @@ def train_zo(model, data, device, args, logger):
         g = torch.Generator(device=device).manual_seed(seed)
         with torch.no_grad():
             for i, p in enumerate(params):
+                if args.zo_weight_decay > 0:
+                    p.mul_(1 - cur_lr * args.zo_weight_decay)  # decoupled (AdamW식)
                 z = torch.randn(p.shape, generator=g, device=device, dtype=p.dtype)
                 grad = scalar * z
                 if args.mode == "zo_sign":
@@ -409,6 +411,9 @@ if __name__ == "__main__":
     p.add_argument("--beta1", type=float, default=0.99)
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--eps", type=float, default=1e-8)
+    p.add_argument("--zo_weight_decay", type=float, default=0.0,
+                   help="ZO용 decoupled weight decay (AdamW 방식: p *= 1 - lr*wd). "
+                        "pseudo_grad에 더하지 않으므로 m/v 통계를 오염시키지 않음")
     p.add_argument("--n_nodes", type=int, default=1)
     # misc
     p.add_argument("--augment", default="auto", choices=["auto", "on", "off"],
