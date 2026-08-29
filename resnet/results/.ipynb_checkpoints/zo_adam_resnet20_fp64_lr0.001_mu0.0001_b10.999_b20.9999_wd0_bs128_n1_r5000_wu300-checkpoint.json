@@ -1,0 +1,46 @@
+{
+  "args": {
+    "mode": "zo_adam",
+    "model": "resnet20",
+    "norm": "group",
+    "dtype": "fp64",
+    "lr": 0.001,
+    "warmup_rounds": 300,
+    "lr_schedule": "constant",
+    "batch_size": 128,
+    "n_rounds": 5000,
+    "eval_every": 10,
+    "weight_decay": 0.0005,
+    "mu": 0.0001,
+    "beta1": 0.999,
+    "beta2": 0.9999,
+    "eps": 1e-08,
+    "zo_weight_decay": 0.0,
+    "precision_probe": false,
+    "curvature_check": true,
+    "n_nodes": 1,
+    "augment": "auto",
+    "label_key": "fine_label",
+    "gpu_resident": true,
+    "data_seed": 0,
+    "torch_seed": null,
+    "out": "results/zo_adam_resnet20_fp64_lr0.001_mu0.0001_b10.999_b20.9999_wd0_bs128_n1_r5000_wu300.json",
+    "use_augment": false
+  },
+  "n_params": 278324,
+  "started_at": "2026-08-29 07:31:08",
+  "history": [
+    {
+      "round": 10,
+      "train_avg": 4.875254,
+      "test_loss": 4.865094,
+      "test_acc": 0.0103,
+      "lr": 3.333e-05,
+      "elapsed": 25.5,
+      "zo_dplus": -0.0001630783,
+      "zo_dminus": -0.0001759529,
+      "zo_curv": 1.28746e-05
+    }
+  ],
+  "final": null
+}
