@@ -3,7 +3,7 @@ mode: proj_adam
 model: resnet20
 dtype: fp32
 norm: group
-act: silu        # relu | gelu | silu | softplus | elu | leaky_relu | tanh
+act: softplus        # relu | gelu | silu | softplus | elu | leaky_relu | tanh
 
 # 초기화
 init: kaiming_normal
