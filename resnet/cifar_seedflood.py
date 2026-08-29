@@ -481,21 +481,28 @@ def zo_gen_dtype(p):
 
 @torch.no_grad()
 def zo_perturb_(params, seed, scale, device):
-    """seed로 z를 재생성하며 in-place perturb. z 저장 안 함."""
+    """seed로 z를 재생성하며 in-place perturb. z 저장 안 함.
+    _foreach_로 묶어서 텐서 수만큼의 개별 커널 launch를 피한다."""
     g = torch.Generator(device=device).manual_seed(seed)
-    for p in params:
-        z = torch.randn(p.shape, generator=g, device=device, dtype=zo_gen_dtype(p))
-        p.add_((scale * z).to(p.dtype))
+    zs = [torch.randn(p.shape, generator=g, device=device, dtype=zo_gen_dtype(p))
+          for p in params]
+    if all(z.dtype == p.dtype for z, p in zip(zs, params)):
+        torch._foreach_add_(params, zs, alpha=scale)
+    else:  # bf16 파라미터: fp32에서 스케일 후 캐스팅
+        torch._foreach_mul_(zs, scale)
+        torch._foreach_add_(params, [z.to(p.dtype) for z, p in zip(zs, params)])
 
 
 @torch.no_grad()
 def zo_loss(model, batches):
     """노드별 로컬 배치 loss의 평균 (SeedFlood의 서버측 평균에 해당).
-    forward는 모델 dtype 그대로 두되(=dtype 실험의 대상), CE 집계는 fp32로."""
-    total = 0.0
+    forward는 모델 dtype 그대로 두되(=dtype 실험의 대상), CE 집계는 fp32로.
+    배치마다 .item()을 부르지 않고 GPU에서 누적 → 라운드당 동기화 횟수 감소."""
+    total = None
     for xb, yb in batches:
-        total += F.cross_entropy(model(xb).float(), yb).item()
-    return total / len(batches)
+        l = F.cross_entropy(model(xb).float(), yb)
+        total = l if total is None else total + l
+    return float(total) / len(batches)
 
 
 @torch.no_grad()
@@ -562,15 +569,21 @@ def proj_dots(grads, params, seeds, device):
 
     SPSA가 forward 2회로 근사하던 방향미분을, backward 1회로 얻은 g와의 내적으로
     정확히 구한다. μ가 없으므로 곡률/3차항 bias도, 차분의 정밀도 소실도 없다.
+
+    성능 주의: 누적을 GPU 텐서로 유지하고 seed당 한 번만 float()로 꺼낸다.
+    텐서마다 .item()을 부르면 파라미터 수 × Q 번 파이프라인이 flush돼서
+    작은 모델에서는 이 동기화가 전체 시간을 지배한다.
     """
     out = []
     for sd in seeds:
         gen = torch.Generator(device=device).manual_seed(sd)
-        s = 0.0
-        for gi, p in zip(grads, params):
-            z = torch.randn(p.shape, generator=gen, device=device, dtype=zo_gen_dtype(p))
-            s += float((gi * z).sum())
-        out.append(s)
+        zs = [torch.randn(p.shape, generator=gen, device=device, dtype=zo_gen_dtype(p))
+              for p in params]
+        torch._foreach_mul_(zs, grads)
+        acc = torch.zeros((), device=device, dtype=torch.float64)
+        for zi in zs:
+            acc += zi.sum().double()
+        out.append(float(acc))  # seed당 1회만 동기화
     return out
 
 
@@ -662,6 +675,7 @@ def train_zo(model, data, device, args, logger):
         # proj 모드는 파라미터를 섭동하지 않으므로 스냅샷이 필요 없다.
         theta = None if args.mode.startswith("proj") else \
             [p.detach().clone() for p in params]
+        pdata = [p.data for p in params]  # leaf 제약 없이 in-place 복원용 뷰
 
         if args.mode.startswith("proj"):
             # ── projected gradient: backward 1회 + 내적 Q회 ──────────────────
@@ -695,12 +709,10 @@ def train_zo(model, data, device, args, logger):
             for sd in seeds:
                 zo_perturb_(params, sd, +args.mu, device)
                 lp = zo_loss(model, batches)
-                for p_, t_ in zip(params, theta):
-                    p_.data.copy_(t_)
+                torch._foreach_copy_(pdata, theta)
                 zo_perturb_(params, sd, -args.mu, device)
                 lm = zo_loss(model, batches)
-                for p_, t_ in zip(params, theta):
-                    p_.data.copy_(t_)
+                torch._foreach_copy_(pdata, theta)
                 scalars.append((lp - lm) / (2 * args.mu))
                 if sd is seeds[0]:
                     l_plus, l_minus = lp, lm  # probe/로그는 첫 query 기준
@@ -715,12 +727,10 @@ def train_zo(model, data, device, args, logger):
                     sd = int(torch.randint(0, 2**31 - 1, (1,)).item())
                     zo_perturb_(params, sd, +args.mu, device)
                     lp = zo_loss(model, [ni_batch])
-                    for p_, t_ in zip(params, theta):
-                        p_.data.copy_(t_)
+                    torch._foreach_copy_(pdata, theta)
                     zo_perturb_(params, sd, -args.mu, device)
                     lm = zo_loss(model, [ni_batch])
-                    for p_, t_ in zip(params, theta):
-                        p_.data.copy_(t_)
+                    torch._foreach_copy_(pdata, theta)
                     seeds.append(sd)
                     scalars.append((lp - lm) / (2 * args.mu))
                     if len(seeds) == 1:
@@ -769,35 +779,53 @@ def train_zo(model, data, device, args, logger):
 
         # update: 같은 seed들로 z 재생성 → pseudo_grad = mean_q(scalar_q · z_q)
         # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
-        gens = [torch.Generator(device=device).manual_seed(sd) for sd in seeds]
+        # update: 같은 seed들로 z 재생성 → pseudo_grad = mean_q(scalar_q · z_q)
+        # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
+        # _foreach_로 파라미터 리스트를 통째로 처리해 커널 launch 수를 줄인다.
         want_cos = (args.mode.startswith("proj") and is_eval_round
                     and args.seed_mode == "shared")
-        cos_dot = cos_pn = 0.0
         with torch.no_grad():
-            for i, p in enumerate(params):
-                if args.zo_weight_decay > 0:
-                    p.mul_(1 - cur_lr * args.zo_weight_decay)  # decoupled (AdamW식)
-                gdt = zo_gen_dtype(p)
-                grad = torch.zeros(p.shape, device=device, dtype=gdt)
-                for q, gen in enumerate(gens):
-                    z = torch.randn(p.shape, generator=gen, device=device, dtype=gdt)
-                    grad.add_(z, alpha=scalars[q] / len(gens))
-                if want_cos:  # 재구성된 방향이 진짜 gradient와 얼마나 정렬됐나
-                    cos_dot += float((grad * g_true[i]).sum())
-                    cos_pn += float((grad * grad).sum())
-                if args.mode.endswith("_sign"):
-                    p.sub_((cur_lr * grad.sign()).to(p.dtype))
-                else:
-                    m[i].mul_(args.beta1).add_(grad, alpha=1 - args.beta1)
-                    v[i].mul_(args.beta2).addcmul_(grad, grad, value=1 - args.beta2)
-                    m_hat = m[i] / (1 - args.beta1 ** rnd)
-                    v_hat = v[i] / (1 - args.beta2 ** rnd)
-                    p.sub_((cur_lr * m_hat / (v_hat.sqrt() + args.eps)).to(p.dtype))
-        if want_cos:
-            gn = math.sqrt(sum(float((gi * gi).sum()) for gi in g_true))
-            denom = math.sqrt(cos_pn) * gn
-            probe["proj_cosine"] = round(cos_dot / denom, 6) if denom > 0 else None
-            probe["proj_grad_norm"] = float(f"{gn:.6e}")
+            if args.zo_weight_decay > 0:
+                torch._foreach_mul_(params, 1 - cur_lr * args.zo_weight_decay)
+
+            grads = [torch.zeros(p.shape, device=device, dtype=zo_gen_dtype(p))
+                     for p in params]
+            for q, sd in enumerate(seeds):
+                gen = torch.Generator(device=device).manual_seed(sd)
+                zs = [torch.randn(p.shape, generator=gen, device=device,
+                                  dtype=zo_gen_dtype(p)) for p in params]
+                torch._foreach_add_(grads, zs, alpha=scalars[q] / len(seeds))
+
+            if want_cos:  # 재구성된 방향이 진짜 gradient와 얼마나 정렬됐나
+                dots = torch._foreach_mul(grads, g_true)
+                cos_dot = float(sum(t.sum().double() for t in dots))
+                cos_pn = math.sqrt(float(sum((t * t).sum().double() for t in grads)))
+                gn = math.sqrt(float(sum((t * t).sum().double() for t in g_true)))
+                denom = cos_pn * gn
+                probe["proj_cosine"] = round(cos_dot / denom, 6) if denom > 0 else None
+                probe["proj_grad_norm"] = float(f"{gn:.6e}")
+
+            if args.mode.endswith("_sign"):
+                steps = torch._foreach_sign(grads)
+                torch._foreach_mul_(steps, cur_lr)
+            else:  # Adam
+                torch._foreach_mul_(m, args.beta1)
+                torch._foreach_add_(m, grads, alpha=1 - args.beta1)
+                torch._foreach_mul_(v, args.beta2)
+                torch._foreach_addcmul_(v, grads, grads, value=1 - args.beta2)
+                bc1 = 1 - args.beta1 ** rnd
+                bc2 = 1 - args.beta2 ** rnd
+                denom_t = torch._foreach_sqrt(v)
+                torch._foreach_div_(denom_t, math.sqrt(bc2))
+                torch._foreach_add_(denom_t, args.eps)
+                steps = torch._foreach_div(m, denom_t)
+                torch._foreach_mul_(steps, cur_lr / bc1)
+
+            if steps[0].dtype == params[0].dtype:
+                torch._foreach_sub_(params, steps)
+            else:  # bf16 파라미터
+                torch._foreach_sub_(params, [s.to(p.dtype)
+                                             for s, p in zip(steps, params)])
 
         if is_eval_round:
             tl, ta = evaluate(model, x_test, y_test, device)
