@@ -333,17 +333,23 @@ def zo_loss(model, batches):
 
 
 @torch.no_grad()
-def precision_probe(model, params, theta, batches, seed, mu, device):
-    """같은 θ / 같은 z / 같은 배치에서 L0, L+, L− 를 fp64 ground truth로 재측정.
+def precision_probe(model, params, theta, batches, seed, mu, device, bias3=False):
+    """같은 θ / 같은 z / 같은 배치에서 L0, L±μ (옵션: L±μ/2)를 fp64로 재측정.
 
     - 호출 시점 조건: θ가 스냅샷(theta)으로 복원된 상태
     - z는 학습 경로와 동일하게 fp32에서 생성 후 fp64로 승격 (같은 방향 보장)
-    - 입력 배치는 이미 캐스팅된 텐서를 fp64로 승격 → compute 정밀도만 분리해서 측정
     - 반환 dict:
         delta  = L+ − L−            (SPSA 신호)
         dplus  = L+ − L0            (한쪽 차분)
         dminus = L0 − L−            (반대쪽 차분)
         curv   = dplus − dminus     (= L+ + L− − 2L0 ≈ μ²·zᵀHz, 선형근사 위반량)
+      bias3=True면 추가로 (forward 2회 더):
+        delta_half = μ/2에서의 (L+ − L−)
+        bias3      = (delta − 2·delta_half) · 4/3
+                     Richardson: ΔL(μ)=2μ·gᵀz + (μ³/3)·T[z,z,z] + O(μ⁵) 이므로
+                     ΔL(μ) − 2ΔL(μ/2) = (μ³/3)(1 − 1/4)·T = (μ³/4)·T
+                     → ×4/3 하면 delta에 실제로 실린 3차항 (μ³/3)·T 크기가 나옴
+        grad_term  = delta − bias3  (1차항 추정치)
     """
     orig_dtype = next(model.parameters()).dtype
     model.double()
@@ -351,25 +357,37 @@ def precision_probe(model, params, theta, batches, seed, mu, device):
     theta64 = [t.to(torch.float64) for t in theta]
     batches64 = [(xb.to(torch.float64), yb) for xb, yb in batches]
 
-    def set_perturbed(sign):
+    def set_perturbed(offset):
         g = torch.Generator(device=device).manual_seed(seed)
         for p_, t_ in zip(params64, theta64):
             z = torch.randn(p_.shape, generator=g, device=device, dtype=torch.float32)
-            p_.data.copy_(t_ + sign * mu * z.double())
+            p_.data.copy_(t_ + offset * z.double())
 
     l_zero = zo_loss(model, batches64)  # params64는 아직 θ 그대로
-    set_perturbed(+1)
+    set_perturbed(+mu)
     l_plus = zo_loss(model, batches64)
-    set_perturbed(-1)
+    set_perturbed(-mu)
     l_minus = zo_loss(model, batches64)
 
-    # 원상복구: dtype 되돌리고 θ 재주입 (bf16→fp64→bf16 왕복은 값 무손실이지만 명시적으로 copy)
+    dplus, dminus = l_plus - l_zero, l_zero - l_minus
+    out = {"delta": l_plus - l_minus, "dplus": dplus, "dminus": dminus,
+           "curv": dplus - dminus}
+
+    if bias3:
+        set_perturbed(+mu / 2)
+        lp_h = zo_loss(model, batches64)
+        set_perturbed(-mu / 2)
+        lm_h = zo_loss(model, batches64)
+        delta_half = lp_h - lm_h
+        b3 = (out["delta"] - 2 * delta_half) * (4.0 / 3.0)
+        out.update({"delta_half": delta_half, "bias3": b3,
+                    "grad_term": out["delta"] - b3})
+
+    # 원상복구: dtype 되돌리고 θ 재주입
     model.to(orig_dtype)
     for p_, t_ in zip(model.parameters(), theta):
         p_.data.copy_(t_)
-    dplus, dminus = l_plus - l_zero, l_zero - l_minus
-    return {"delta": l_plus - l_minus, "dplus": dplus, "dminus": dminus,
-            "curv": dplus - dminus}
+    return out
 
 
 def train_zo(model, data, device, args, logger):
@@ -431,13 +449,18 @@ def train_zo(model, data, device, args, logger):
             # θ 복원된 지금 시점에 같은 seed/배치로 fp64 재측정
             delta_run = l_plus - l_minus
             pr = precision_probe(model, params, theta, batches,
-                                 seed, args.mu, device)
+                                 seed, args.mu, device, bias3=args.bias3_probe)
             probe.update({
                 "zo_delta": float(f"{delta_run:.6e}"),
                 "zo_delta_fp64": float(f"{pr['delta']:.6e}"),
                 "zo_delta_err": float(f"{delta_run - pr['delta']:.6e}"),
                 "zo_curv_fp64": float(f"{pr['curv']:.6e}"),
             })
+            if args.bias3_probe:
+                probe.update({
+                    "zo_bias3": float(f"{pr['bias3']:.6e}"),
+                    "zo_grad_term": float(f"{pr['grad_term']:.6e}"),
+                })
 
         # update: 같은 seed로 z 재생성 → pseudo_grad = scalar·z
         # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
@@ -522,6 +545,10 @@ if __name__ == "__main__":
                    help="eval마다 같은 θ/z/배치로 ΔL을 fp64 재측정해서 "
                         "zo_delta / zo_delta_fp64 / zo_delta_err / zo_curv_fp64를 "
                         "history에 기록 (측정 노이즈 바닥 추적, ZO 모드 전용)")
+    p.add_argument("--bias3_probe", action="store_true",
+                   help="--precision_probe와 함께: μ와 μ/2에서 ΔL을 재고 Richardson으로 "
+                        "3차항 bias를 직접 추출 → zo_bias3 / zo_grad_term 기록. "
+                        "|zo_bias3 / zo_delta_fp64|가 실제 bias 비중 (fp64 forward 2회 추가)")
     p.add_argument("--curvature_check", action="store_true",
                    help="eval마다 무섭동 L0도 측정해서 (L+−L0) vs (L0−L−) 대칭성 검증. "
                         "zo_dplus / zo_dminus / zo_curv(=μ²·zᵀHz 추정) 기록 "
@@ -555,6 +582,9 @@ if __name__ == "__main__":
     if args.precision_probe and not is_zo:
         print("[warn] --precision_probe는 zo 모드 전용 → 비활성")
         args.precision_probe = False
+    if args.bias3_probe and not args.precision_probe:
+        print("[info] --bias3_probe는 --precision_probe를 필요로 함 → 함께 활성화")
+        args.precision_probe = is_zo
     if args.curvature_check and not is_zo:
         print("[warn] --curvature_check는 zo 모드 전용 → 비활성")
         args.curvature_check = False
