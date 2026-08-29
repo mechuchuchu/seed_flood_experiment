@@ -13,8 +13,8 @@ zero_init_residual: false
 
 lr: 3.0e-5
 mu: 2.5e-3
-batch_size: 128
-n_rounds: 3000
+batch_size: 512
+n_rounds: 300000
 eval_every: 200
 warmup_rounds: 200
 lr_schedule: constant
@@ -23,10 +23,10 @@ lr_schedule: constant
 fo_warmup_steps: 0
 fo_warmup_lr: 0.05
 
-beta1: 0.99
-beta2: 0.999
+beta1: 0.999
+beta2: 0.9999
 zo_weight_decay: 0.0
-n_nodes: 4
+n_nodes: 1
 n_queries: 1     # 라운드당 z 방향 수 (분산 1/Q, forward 비용 2Q배)
 seed_mode: shared  # shared | per_node
 
