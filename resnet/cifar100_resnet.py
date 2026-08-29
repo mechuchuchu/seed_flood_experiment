@@ -142,15 +142,37 @@ def make_norm(kind: str, ch: int):
     raise ValueError(kind)
 
 
+def make_act(kind: str):
+    """활성함수 팩토리.
+
+    ZO 관점 메모: ReLU는 0에서 미분 불가능(piecewise linear)이라 SPSA의 테일러 전개
+    전제가 깨지는 지점이 존재한다. μ 크기의 perturbation이 많은 뉴런의 부호를 뒤집으면
+    L±가 서로 다른 선형 조각(linear region) 위에서 평가되어, ΔL이 국소 gradient가 아닌
+    조각 간 점프를 재게 된다. GELU/SiLU/Softplus 같은 매끄러운 활성함수는 이 문제가
+    없어서 ZO에서 더 안정적일 수 있다 — dead ReLU로 인한 gradient 소실도 함께 회피.
+    """
+    return {
+        "relu": nn.ReLU(inplace=True),
+        "gelu": nn.GELU(),
+        "silu": nn.SiLU(inplace=True),
+        "softplus": nn.Softplus(beta=5.0),  # beta↑ 일수록 relu에 가까움
+        "elu": nn.ELU(inplace=True),
+        "leaky_relu": nn.LeakyReLU(0.01, inplace=True),
+        "tanh": nn.Tanh(),
+    }[kind]
+
+
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_ch, out_ch, stride=1, norm="batch"):
+    def __init__(self, in_ch, out_ch, stride=1, norm="batch", act="relu"):
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False)
         self.n1 = make_norm(norm, out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False)
         self.n2 = make_norm(norm, out_ch)
+        self.act1 = make_act(act)
+        self.act2 = make_act(act)
         self.shortcut = nn.Sequential()
         if stride != 1 or in_ch != out_ch:
             self.shortcut = nn.Sequential(
@@ -159,47 +181,48 @@ class BasicBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = F.relu(self.n1(self.conv1(x)))
+        out = self.act1(self.n1(self.conv1(x)))
         out = self.n2(self.conv2(out))
-        return F.relu(out + self.shortcut(x))
+        return self.act2(out + self.shortcut(x))
 
 
 class ResNet(nn.Module):
-    def __init__(self, num_blocks, widths, num_classes=100, norm="batch"):
+    def __init__(self, num_blocks, widths, num_classes=100, norm="batch", act="relu"):
         super().__init__()
         self.in_ch = widths[0]
         self.conv1 = nn.Conv2d(3, widths[0], 3, 1, 1, bias=False)
         self.n1 = make_norm(norm, widths[0])
+        self.act1 = make_act(act)
         layers = []
         for i, (nb, w) in enumerate(zip(num_blocks, widths)):
             stride = 1 if i == 0 else 2
-            layers.append(self._make_layer(w, nb, stride, norm))
+            layers.append(self._make_layer(w, nb, stride, norm, act))
         self.layers = nn.Sequential(*layers)
         self.fc = nn.Linear(widths[-1], num_classes)
 
-    def _make_layer(self, out_ch, n_blocks, stride, norm):
+    def _make_layer(self, out_ch, n_blocks, stride, norm, act):
         strides = [stride] + [1] * (n_blocks - 1)
         blocks = []
         for s in strides:
-            blocks.append(BasicBlock(self.in_ch, out_ch, s, norm))
+            blocks.append(BasicBlock(self.in_ch, out_ch, s, norm, act))
             self.in_ch = out_ch
         return nn.Sequential(*blocks)
 
     def forward(self, x):
-        out = F.relu(self.n1(self.conv1(x)))
+        out = self.act1(self.n1(self.conv1(x)))
         out = self.layers(out)
         out = F.adaptive_avg_pool2d(out, 1).flatten(1)
         return self.fc(out)
 
 
-def resnet20(num_classes=100, norm="batch"):
+def resnet20(num_classes=100, norm="batch", act="relu"):
     """~0.28M params — ZO 스크리닝용으로 현실적인 크기"""
-    return ResNet([3, 3, 3], [16, 32, 64], num_classes, norm)
+    return ResNet([3, 3, 3], [16, 32, 64], num_classes, norm, act)
 
 
-def resnet18(num_classes=100, norm="batch"):
+def resnet18(num_classes=100, norm="batch", act="relu"):
     """~11.2M params — FO baseline / 나중 스케일업용"""
-    return ResNet([2, 2, 2, 2], [64, 128, 256, 512], num_classes, norm)
+    return ResNet([2, 2, 2, 2], [64, 128, 256, 512], num_classes, norm, act)
 
 
 MODELS = {"resnet20": resnet20, "resnet18": resnet18}
@@ -210,7 +233,8 @@ MODELS = {"resnet20": resnet20, "resnet18": resnet18}
 # ----------------------------------------------------------------------------
 
 
-def init_model(model, scheme="default", gain=1.0, fc_scale=1.0, zero_init_residual=False):
+def init_model(model, scheme="default", gain=1.0, fc_scale=1.0,
+               zero_init_residual=False, act="relu"):
     """Conv/Linear weight 초기화 스킴 적용.
 
     scheme:
@@ -230,14 +254,17 @@ def init_model(model, scheme="default", gain=1.0, fc_scale=1.0, zero_init_residu
           시작 (Goyal et al. 2017). 깊은 net에서 초기 신호 전파 안정화.
     """
     norm_types = (nn.BatchNorm2d, nn.GroupNorm)
+    # kaiming의 nonlinearity 인자: 지원되는 것만 매핑, 나머지는 relu gain 사용
+    kaiming_nl = {"relu": "relu", "leaky_relu": "leaky_relu", "tanh": "tanh",
+                  "selu": "selu"}.get(act, "relu")
     if scheme != "default":
         for mod in model.modules():
             if isinstance(mod, (nn.Conv2d, nn.Linear)):
                 w = mod.weight
                 if scheme == "kaiming_normal":
-                    nn.init.kaiming_normal_(w, mode="fan_out", nonlinearity="relu")
+                    nn.init.kaiming_normal_(w, mode="fan_out", nonlinearity=kaiming_nl)
                 elif scheme == "kaiming_uniform":
-                    nn.init.kaiming_uniform_(w, mode="fan_out", nonlinearity="relu")
+                    nn.init.kaiming_uniform_(w, mode="fan_out", nonlinearity=kaiming_nl)
                 elif scheme == "xavier_normal":
                     nn.init.xavier_normal_(w)
                 elif scheme == "xavier_uniform":
@@ -517,8 +544,52 @@ def precision_probe(model, params, theta, batches, seed, mu, device, bias3=False
     return out
 
 
+def run_fo_warmup(model, data, device, args, logger):
+    """ZO 시작 전 FO(SGD+momentum)로 지정 step만큼 사전 학습.
+
+    목적: 균등분포 흡수 상태(loss ≈ ln C, gradient 소실)를 FO로 먼저 빠져나온 뒤
+    ZO에 넘겨서, "ZO가 학습을 못 하는가" vs "초기 탈출만 못 하는가"를 분리한다.
+    통신량 O(1) 가정을 깨므로 배포 방식이 아니라 진단용.
+
+    ZO Adam의 m/v는 이월하지 않고 0에서 시작한다 (train_zo가 새로 만듦).
+    """
+    x_train, y_train, x_test, y_test = data
+    dtype = next(model.parameters()).dtype
+    opt = torch.optim.SGD(model.parameters(), lr=args.fo_warmup_lr, momentum=0.9,
+                          weight_decay=args.weight_decay)
+    model.train()
+    t0 = time.time()
+    running = []
+    for step in range(1, args.fo_warmup_steps + 1):
+        xb, yb = get_batch(x_train, y_train, args.batch_size, device,
+                           augment=args.use_augment, dtype=dtype)
+        loss = F.cross_entropy(model(xb).float(), yb)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        running.append(loss.item())
+        if step % args.eval_every == 0 or step == args.fo_warmup_steps:
+            tl, ta = evaluate(model, x_test, y_test, device)
+            print(f"[fo-warmup] step {step:5d} | train_avg {np.mean(running):.4f} | "
+                  f"test_loss {tl:.4f} | test_acc {ta:.4f} | {time.time() - t0:.0f}s")
+            running = []
+    tl, ta = evaluate(model, x_test, y_test, device)
+    logger.record["fo_warmup"] = {
+        "steps": args.fo_warmup_steps,
+        "lr": args.fo_warmup_lr,
+        "handoff_test_loss": round(float(tl), 6),
+        "handoff_test_acc": round(float(ta), 6),
+        "sec": round(time.time() - t0, 1),
+    }
+    logger._dump()
+    print(f"[fo-warmup] handoff → ZO at test_loss {tl:.4f}, acc {ta:.4f}")
+    return model
+
+
 def train_zo(model, data, device, args, logger):
     x_train, y_train, x_test, y_test = data
+    if args.fo_warmup_steps > 0:
+        run_fo_warmup(model, data, device, args, logger)
     model.train()  # (norm=group이면 train/eval 동작 동일, dropout 없음)
     params = list(model.parameters())
     dtype = next(model.parameters()).dtype
@@ -650,10 +721,14 @@ def default_out(args):
         tag += f"_{args.lr_schedule}"
     if args.init != "default":
         tag += f"_{args.init}"
+    if args.act != "relu":
+        tag += f"_{args.act}"
     if args.init_gain != 1.0:
         tag += f"_g{args.init_gain:g}"
     if args.fc_scale != 1.0:
         tag += f"_fc{args.fc_scale:g}"
+    if args.fo_warmup_steps > 0:
+        tag += f"_fowu{args.fo_warmup_steps}@{args.fo_warmup_lr:g}"
     return os.path.join("results", tag + ".json")
 
 
@@ -721,6 +796,12 @@ if __name__ == "__main__":
                         "zo_dplus / zo_dminus / zo_curv(=μ²·zᵀHz 추정) 기록 "
                         "(SPSA 선형근사 위반 = mu bias 추적, ZO 모드 전용)")
     p.add_argument("--n_nodes", type=int, default=1)
+    p.add_argument("--act", default="relu",
+                   choices=["relu", "gelu", "silu", "softplus", "elu",
+                            "leaky_relu", "tanh"],
+                   help="활성함수. ReLU는 0에서 미분 불가라 μ 섭동이 뉴런 부호를 뒤집으면 "
+                        "L±가 서로 다른 linear region에서 평가됨 → gelu/silu/softplus 같은 "
+                        "매끄러운 함수가 ZO에서 더 안정적일 수 있음")
     p.add_argument("--init", default="default",
                    choices=["default", "kaiming_normal", "kaiming_uniform",
                             "xavier_normal", "xavier_uniform", "orthogonal"],
@@ -732,6 +813,13 @@ if __name__ == "__main__":
                         "(<1이면 초기 로짓이 작아짐)")
     p.add_argument("--zero_init_residual", action="store_true",
                    help="각 블록의 두 번째 norm weight를 0으로 → 블록이 항등함수로 시작")
+    p.add_argument("--fo_warmup_steps", type=int, default=0,
+                   help="ZO 시작 전 FO(SGD+momentum)로 학습할 step 수. "
+                        "흡수 상태 탈출 후 ZO로 넘겨서 'ZO가 못 배우는가 vs 탈출만 "
+                        "못 하는가'를 분리하는 진단용 (O(1) 통신 가정을 깨므로 배포용 아님). "
+                        "ZO Adam의 m/v는 이월하지 않고 0에서 시작")
+    p.add_argument("--fo_warmup_lr", type=float, default=0.05,
+                   help="FO warmup 구간의 SGD lr (ZO의 --lr과 별개)")
     p.add_argument("--early_abort", action="store_true",
                    help="|g^T z| 신호가 초기 대비 붕괴하고 loss가 uniform(ln C) 근처에 "
                         "머물면 조기 종료 (grid sweep에서 죽은 조합 낭비 방지)")
@@ -773,6 +861,9 @@ if __name__ == "__main__":
     if args.precision_probe and not is_zo:
         print("[warn] --precision_probe는 zo 모드 전용 → 비활성")
         args.precision_probe = False
+    if args.fo_warmup_steps > 0 and not is_zo:
+        print("[warn] --fo_warmup_steps는 zo 모드 전용 → 무시")
+        args.fo_warmup_steps = 0
     if args.bias3_probe and not args.precision_probe:
         print("[info] --bias3_probe는 --precision_probe를 필요로 함 → 함께 활성화")
         args.precision_probe = is_zo
@@ -792,14 +883,15 @@ if __name__ == "__main__":
     data = load_cifar100_ram(label_key=args.label_key, storage_device=storage)
     num_classes = 100 if args.label_key == "fine_label" else 20
     DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp64": torch.float64}
-    model = MODELS[args.model](num_classes=num_classes, norm=args.norm)
+    model = MODELS[args.model](num_classes=num_classes, norm=args.norm, act=args.act)
     model = init_model(model, scheme=args.init, gain=args.init_gain,
                        fc_scale=args.fc_scale,
-                       zero_init_residual=args.zero_init_residual)
+                       zero_init_residual=args.zero_init_residual, act=args.act)
     model = model.to(device=device, dtype=DTYPES[args.dtype])
     stats = param_stats(model)
     n_params = stats["n_params"]
-    print(f"[model] {args.model} ({args.norm} norm, {args.dtype}, init={args.init}"
+    print(f"[model] {args.model} ({args.norm} norm, {args.act}, {args.dtype}, "
+          f"init={args.init}"
           f"{f'×{args.init_gain:g}' if args.init_gain != 1.0 else ''}): "
           f"{n_params / 1e6:.2f}M params, mode={args.mode}, device={device}")
     if is_zo:
