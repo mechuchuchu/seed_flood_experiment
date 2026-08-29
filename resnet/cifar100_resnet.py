@@ -222,15 +222,17 @@ class RunLogger:
         self.out = args.out
         os.makedirs(os.path.dirname(self.out) or ".", exist_ok=True)
 
-    def log(self, rnd, train_avg, test_loss, test_acc, elapsed, lr=None):
-        self.record["history"].append({
+    def log(self, rnd, train_avg, test_loss, test_acc, elapsed, lr=None, **extra):
+        entry = {
             "round": rnd,
             "train_avg": round(float(train_avg), 6),
             "test_loss": round(float(test_loss), 6),
             "test_acc": round(float(test_acc), 6),
             "lr": round(float(lr), 8) if lr is not None else None,
             "elapsed": round(elapsed, 1),
-        })
+        }
+        entry.update(extra)  # e.g. precision probe: zo_delta / zo_delta_fp64 / zo_delta_err
+        self.record["history"].append(entry)
         self._dump()  # 매 eval마다 저장 → 중간에 죽어도 로그 살아있음
 
     def finalize(self, test_loss, test_acc, elapsed):
@@ -330,6 +332,41 @@ def zo_loss(model, batches):
     return total / len(batches)
 
 
+@torch.no_grad()
+def precision_probe(model, params, theta, batches, seed, mu, device):
+    """같은 θ / 같은 z / 같은 배치에서 ΔL = L+ − L− 를 fp64 ground truth로 재측정.
+
+    - 호출 시점 조건: θ가 스냅샷(theta)으로 복원된 상태
+    - z는 학습 경로와 동일하게 fp32에서 생성 후 fp64로 승격 (같은 방향 보장)
+    - 입력 배치는 이미 캐스팅된 텐서를 fp64로 승격 → compute 정밀도만 분리해서 측정
+      (입력 양자화 효과는 L+/L− 양쪽에 동일하게 들어가 ΔL에서 거의 상쇄됨)
+    - 반환: fp64에서의 (L+ − L−). 실행 dtype에서의 값과 비교하면 그 시점의
+      측정 노이즈 바닥을 알 수 있음
+    """
+    orig_dtype = next(model.parameters()).dtype
+    model.double()
+    params64 = list(model.parameters())
+    theta64 = [t.to(torch.float64) for t in theta]
+    batches64 = [(xb.to(torch.float64), yb) for xb, yb in batches]
+
+    def set_perturbed(sign):
+        g = torch.Generator(device=device).manual_seed(seed)
+        for p_, t_ in zip(params64, theta64):
+            z = torch.randn(p_.shape, generator=g, device=device, dtype=torch.float32)
+            p_.data.copy_(t_ + sign * mu * z.double())
+
+    set_perturbed(+1)
+    l_plus = zo_loss(model, batches64)
+    set_perturbed(-1)
+    l_minus = zo_loss(model, batches64)
+
+    # 원상복구: dtype 되돌리고 θ 재주입 (bf16→fp64→bf16 왕복은 값 무손실이지만 명시적으로 copy)
+    model.to(orig_dtype)
+    for p_, t_ in zip(model.parameters(), theta):
+        p_.data.copy_(t_)
+    return l_plus - l_minus
+
+
 def train_zo(model, data, device, args, logger):
     x_train, y_train, x_test, y_test = data
     model.train()  # (norm=group이면 train/eval 동작 동일, dropout 없음)
@@ -373,6 +410,19 @@ def train_zo(model, data, device, args, logger):
         running.append((l_plus + l_minus) / 2)
         cur_lr = lr_at(rnd, args)
 
+        is_eval_round = (rnd % args.eval_every == 0 or rnd == args.n_rounds)
+        probe = {}
+        if args.precision_probe and is_eval_round:
+            # θ 복원된 지금 시점에 같은 seed/배치로 fp64 재측정
+            delta_run = l_plus - l_minus
+            delta_fp64 = precision_probe(model, params, theta, batches,
+                                         seed, args.mu, device)
+            probe = {
+                "zo_delta": float(f"{delta_run:.6e}"),
+                "zo_delta_fp64": float(f"{delta_fp64:.6e}"),
+                "zo_delta_err": float(f"{delta_run - delta_fp64:.6e}"),
+            }
+
         # update: 같은 seed로 z 재생성 → pseudo_grad = scalar·z
         # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
         g = torch.Generator(device=device).manual_seed(seed)
@@ -392,10 +442,10 @@ def train_zo(model, data, device, args, logger):
                     v_hat = v[i] / (1 - args.beta2 ** rnd)
                     p.sub_((cur_lr * m_hat / (v_hat.sqrt() + args.eps)).to(p.dtype))
 
-        if rnd % args.eval_every == 0 or rnd == args.n_rounds:
+        if is_eval_round:
             tl, ta = evaluate(model, x_test, y_test, device)
             el = time.time() - t0
-            logger.log(rnd, np.mean(running), tl, ta, el, lr=cur_lr)
+            logger.log(rnd, np.mean(running), tl, ta, el, lr=cur_lr, **probe)
             print(f"round {rnd:6d} | train_avg {np.mean(running):.4f} | "
                   f"test_loss {tl:.4f} | test_acc {ta:.4f} | {el:.0f}s")
             running = []
@@ -445,6 +495,10 @@ if __name__ == "__main__":
     p.add_argument("--zo_weight_decay", type=float, default=0.0,
                    help="ZO용 decoupled weight decay (AdamW 방식: p *= 1 - lr*wd). "
                         "pseudo_grad에 더하지 않으므로 m/v 통계를 오염시키지 않음")
+    p.add_argument("--precision_probe", action="store_true",
+                   help="eval마다 같은 θ/z/배치로 ΔL을 fp64 재측정해서 "
+                        "zo_delta / zo_delta_fp64 / zo_delta_err를 history에 기록 "
+                        "(측정 노이즈 바닥 추적, ZO 모드 전용)")
     p.add_argument("--n_nodes", type=int, default=1)
     # misc
     p.add_argument("--augment", default="auto", choices=["auto", "on", "off"],
@@ -468,6 +522,12 @@ if __name__ == "__main__":
     if is_zo and args.norm == "batch":
         print("[warn] zo + BatchNorm: ±μ forward마다 running stats가 갱신되어 "
               "측정이 오염될 수 있음 (--norm group 권장)")
+    if args.precision_probe and args.dtype == "fp64":
+        print("[warn] --precision_probe는 fp64 런에서 무의미 (자기 자신과 비교) → 비활성")
+        args.precision_probe = False
+    if args.precision_probe and not is_zo:
+        print("[warn] --precision_probe는 zo 모드 전용 → 비활성")
+        args.precision_probe = False
     args.use_augment = (args.mode == "fo") if args.augment == "auto" else (args.augment == "on")
     if args.out is None:
         args.out = default_out(args)
