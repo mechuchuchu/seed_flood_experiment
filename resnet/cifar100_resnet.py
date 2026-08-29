@@ -6,8 +6,9 @@ FO baseline + shared-seed ZO (SPSA) — sign / Adam 모드
 - 전체 데이터를 uint8 텐서로 RAM(또는 GPU)에 상주, DataLoader 없이 인덱스 샘플링
 - shared-seed SPSA: 라운드당 seed 1개 → 전 노드 같은 z 방향, loss 노드 평균 →
   scalar = (L+ − L−)/(2μ), pseudo_grad = scalar·z  (mnist_seedflood_sweep.py와 동일 구조)
-- z는 저장하지 않고 seed로 3회 재생성 (perturb +μ / −2μ / 복원 +μ) → 메모리 O(params) 추가분 없음
-  (단 zo_adam은 m, v 버퍼로 2x params 추가)
+- z는 저장하지 않고 seed로 재생성 (±μ perturb 2회 + update 1회), θ 복원은 스냅샷 copy
+  (산술 복원은 bf16에서 rounding 잔차가 μ 스케일로 남음 — 아래 dtype 주의 참고)
+  (zo_adam은 m, v 버퍼로 2x params 추가, fp32/fp64 master)
 - 모든 결과는 json 하나에 저장: args(hyperparams) + round별 시계열 + final
   → aggregate_results.py에 그대로 물릴 수 있는 flat 구조
 
@@ -85,7 +86,8 @@ def augment_batch(x: torch.Tensor, pad: int = 4) -> torch.Tensor:
     return xc
 
 
-def get_batch(x, y, batch_size, device, indices=None, augment=False, generator=None):
+def get_batch(x, y, batch_size, device, indices=None, augment=False, generator=None,
+              dtype=None):
     """RAM 상주 텐서에서 랜덤 배치 하나. indices 주면 그 부분집합(=노드 파티션)에서만 샘플."""
     if indices is None:
         idx = torch.randint(0, x.size(0), (batch_size,), generator=generator)
@@ -97,6 +99,8 @@ def get_batch(x, y, batch_size, device, indices=None, augment=False, generator=N
     xb = normalize(xb)
     if augment:
         xb = augment_batch(xb)
+    if dtype is not None:
+        xb = xb.to(dtype)  # normalize/augment는 fp32에서 하고 마지막에 캐스팅
     return xb, yb
 
 
@@ -111,13 +115,14 @@ def build_node_indices(n_total: int, n_nodes: int, seed: int = 0):
 def evaluate(model, x_test, y_test, device, batch_size=1000):
     was_training = model.training
     model.eval()
+    dtype = next(model.parameters()).dtype
     total_loss, correct = 0.0, 0
     n = x_test.size(0)
     for i in range(0, n, batch_size):
-        xb = normalize(x_test[i : i + batch_size].to(device))
+        xb = normalize(x_test[i : i + batch_size].to(device)).to(dtype)
         yb = y_test[i : i + batch_size].to(device)
         logits = model(xb)
-        total_loss += F.cross_entropy(logits, yb, reduction="sum").item()
+        total_loss += F.cross_entropy(logits.float(), yb, reduction="sum").item()
         correct += (logits.argmax(1) == yb).sum().item()
     if was_training:
         model.train()
@@ -267,6 +272,7 @@ def lr_at(rnd, args):
 def train_fo(model, data, device, args, logger):
     x_train, y_train, x_test, y_test = data
     model.train()
+    dtype = next(model.parameters()).dtype
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
                           weight_decay=args.weight_decay)
 
@@ -277,8 +283,8 @@ def train_fo(model, data, device, args, logger):
         for grp in opt.param_groups:
             grp["lr"] = cur_lr
         xb, yb = get_batch(x_train, y_train, args.batch_size, device,
-                           augment=args.use_augment)
-        loss = F.cross_entropy(model(xb), yb)
+                           augment=args.use_augment, dtype=dtype)
+        loss = F.cross_entropy(model(xb).float(), yb)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -298,21 +304,29 @@ def train_fo(model, data, device, args, logger):
 # ----------------------------------------------------------------------------
 
 
+def zo_gen_dtype(p):
+    """z 생성용 dtype: 파라미터가 fp64면 fp64, 그 외(fp32/bf16)는 fp32.
+    bf16에서 직접 randn을 뽑지 않는 이유: perturb와 update가 같은 z를 재생성해야
+    하는데, 생성/스케일링을 fp32 경로로 고정해두면 dtype별 RNG 구현 차이에서 자유로움."""
+    return torch.float64 if p.dtype == torch.float64 else torch.float32
+
+
 @torch.no_grad()
 def zo_perturb_(params, seed, scale, device):
     """seed로 z를 재생성하며 in-place perturb. z 저장 안 함."""
     g = torch.Generator(device=device).manual_seed(seed)
     for p in params:
-        z = torch.randn(p.shape, generator=g, device=device, dtype=p.dtype)
-        p.add_(scale * z)
+        z = torch.randn(p.shape, generator=g, device=device, dtype=zo_gen_dtype(p))
+        p.add_((scale * z).to(p.dtype))
 
 
 @torch.no_grad()
 def zo_loss(model, batches):
-    """노드별 로컬 배치 loss의 평균 (SeedFlood의 서버측 평균에 해당)."""
+    """노드별 로컬 배치 loss의 평균 (SeedFlood의 서버측 평균에 해당).
+    forward는 모델 dtype 그대로 두되(=dtype 실험의 대상), CE 집계는 fp32로."""
     total = 0.0
     for xb, yb in batches:
-        total += F.cross_entropy(model(xb), yb).item()
+        total += F.cross_entropy(model(xb).float(), yb).item()
     return total / len(batches)
 
 
@@ -320,11 +334,15 @@ def train_zo(model, data, device, args, logger):
     x_train, y_train, x_test, y_test = data
     model.train()  # (norm=group이면 train/eval 동작 동일, dropout 없음)
     params = list(model.parameters())
+    dtype = next(model.parameters()).dtype
     node_indices = build_node_indices(x_train.size(0), args.n_nodes, seed=args.data_seed)
 
+    # optimizer state는 파라미터가 bf16이어도 fp32 master로 유지
+    # (bf16은 mantissa 8bit라 beta1=0.999 같은 계수 자체가 표현이 안 되고,
+    #  (1-beta2)=1e-4 스케일 누적이 바로 소실됨)
     if args.mode == "zo_adam":
-        m = [torch.zeros_like(p) for p in params]
-        v = [torch.zeros_like(p) for p in params]
+        m = [torch.zeros(p.shape, device=device, dtype=zo_gen_dtype(p)) for p in params]
+        v = [torch.zeros(p.shape, device=device, dtype=zo_gen_dtype(p)) for p in params]
 
     running, t0 = [], time.time()
     tl = ta = float("nan")
@@ -334,36 +352,45 @@ def train_zo(model, data, device, args, logger):
         # 각 노드가 로컬 배치 하나씩 샘플 (± 두 평가에 같은 배치 재사용)
         batches = [
             get_batch(x_train, y_train, args.batch_size, device,
-                      indices=ni, augment=args.use_augment)
+                      indices=ni, augment=args.use_augment, dtype=dtype)
             for ni in node_indices
         ]
 
+        # θ 스냅샷 복원 방식: 산술 복원(+μ→−2μ→+μ)은 bf16에서 rounding 잔차가
+        # μ와 같은 스케일(~1e-2)로 남아 매 라운드 θ를 오염시킴 → copy로 정확 복원.
+        # 두 평가 모두 같은 θ에서 ±quantize(μz)로 대칭 처리됨. 메모리 +1x params.
+        theta = [p.detach().clone() for p in params]
         zo_perturb_(params, seed, +args.mu, device)
         l_plus = zo_loss(model, batches)
-        zo_perturb_(params, seed, -2 * args.mu, device)
+        for p_, t_ in zip(params, theta):
+            p_.data.copy_(t_)
+        zo_perturb_(params, seed, -args.mu, device)
         l_minus = zo_loss(model, batches)
-        zo_perturb_(params, seed, +args.mu, device)  # θ 복원
+        for p_, t_ in zip(params, theta):
+            p_.data.copy_(t_)
 
         scalar = (l_plus - l_minus) / (2 * args.mu)
         running.append((l_plus + l_minus) / 2)
         cur_lr = lr_at(rnd, args)
 
         # update: 같은 seed로 z 재생성 → pseudo_grad = scalar·z
+        # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
         g = torch.Generator(device=device).manual_seed(seed)
         with torch.no_grad():
             for i, p in enumerate(params):
                 if args.zo_weight_decay > 0:
                     p.mul_(1 - cur_lr * args.zo_weight_decay)  # decoupled (AdamW식)
-                z = torch.randn(p.shape, generator=g, device=device, dtype=p.dtype)
+                z = torch.randn(p.shape, generator=g, device=device,
+                                dtype=zo_gen_dtype(p))
                 grad = scalar * z
                 if args.mode == "zo_sign":
-                    p.sub_(cur_lr * grad.sign())
+                    p.sub_((cur_lr * grad.sign()).to(p.dtype))
                 else:  # zo_adam
                     m[i].mul_(args.beta1).add_(grad, alpha=1 - args.beta1)
                     v[i].mul_(args.beta2).addcmul_(grad, grad, value=1 - args.beta2)
                     m_hat = m[i] / (1 - args.beta1 ** rnd)
                     v_hat = v[i] / (1 - args.beta2 ** rnd)
-                    p.sub_(cur_lr * m_hat / (v_hat.sqrt() + args.eps))
+                    p.sub_((cur_lr * m_hat / (v_hat.sqrt() + args.eps)).to(p.dtype))
 
         if rnd % args.eval_every == 0 or rnd == args.n_rounds:
             tl, ta = evaluate(model, x_test, y_test, device)
@@ -393,6 +420,10 @@ if __name__ == "__main__":
     p.add_argument("--model", default="resnet20", choices=list(MODELS))
     p.add_argument("--norm", default="auto", choices=["auto", "batch", "group"],
                    help="auto: fo→batch, zo→group (BN running stats 오염 회피)")
+    p.add_argument("--dtype", default="fp32", choices=["fp32", "bf16", "fp64"],
+                   help="모델/forward dtype. ZO에서 bf16은 L+−L− 차이가 rounding에 "
+                        "묻힐 수 있음(측정 정밀도 축의 일부). optimizer state와 z "
+                        "생성/업데이트 계산은 dtype 무관하게 fp32(fp64면 fp64) 유지")
     # 공통 hyperparams
     p.add_argument("--lr", type=float, default=None,
                    help="default: fo=0.1, zo_sign=1e-3, zo_adam=1e-3")
@@ -449,10 +480,12 @@ if __name__ == "__main__":
 
     data = load_cifar100_ram(label_key=args.label_key, storage_device=storage)
     num_classes = 100 if args.label_key == "fine_label" else 20
-    model = MODELS[args.model](num_classes=num_classes, norm=args.norm).to(device)
+    DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp64": torch.float64}
+    model = MODELS[args.model](num_classes=num_classes, norm=args.norm)
+    model = model.to(device=device, dtype=DTYPES[args.dtype])
     n_params = sum(par.numel() for par in model.parameters())
-    print(f"[model] {args.model} ({args.norm} norm): {n_params / 1e6:.2f}M params, "
-          f"mode={args.mode}, device={device}")
+    print(f"[model] {args.model} ({args.norm} norm, {args.dtype}): "
+          f"{n_params / 1e6:.2f}M params, mode={args.mode}, device={device}")
     print(f"[out] {args.out}")
 
     logger = RunLogger(args, n_params)
