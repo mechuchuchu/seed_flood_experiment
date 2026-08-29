@@ -1,11 +1,12 @@
 # SeedFlood ZO base config (CLI 인자가 이 값들을 override함)
-mode: zo_sign
+mode: zo_adam
 model: resnet20
 dtype: fp32
 norm: group
+act: relu        # relu | gelu | silu | softplus | elu | leaky_relu | tanh
 
 # 초기화
-init: orthogonal
+init: kaiming_normal
 init_gain: 1.0
 fc_scale: 1.0
 zero_init_residual: false
@@ -17,6 +18,10 @@ n_rounds: 3000
 eval_every: 200
 warmup_rounds: 200
 lr_schedule: constant
+
+# FO warmup (진단용: 0이면 순수 ZO)
+fo_warmup_steps: 0
+fo_warmup_lr: 0.05
 
 beta1: 0.99
 beta2: 0.999
