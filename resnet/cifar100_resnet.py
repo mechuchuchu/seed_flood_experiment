@@ -474,9 +474,16 @@ def train_zo(model, data, device, args, logger):
 
 
 def default_out(args):
-    tag = (f"{args.mode}_{args.model}_lr{args.lr:g}_mu{args.mu:g}"
-           f"_b1{args.beta1:g}_b2{args.beta2:g}_bs{args.batch_size}"
-           f"_n{args.n_nodes}_r{args.n_rounds}")
+    """조합을 파일명으로 인코딩 (aggregate 시 파일명만으로 조건 식별 가능하게).
+    zo_weight_decay는 zo 모드, weight_decay는 fo 모드에서만 붙임."""
+    wd = args.zo_weight_decay if args.mode.startswith("zo") else args.weight_decay
+    tag = (f"{args.mode}_{args.model}_{args.dtype}_lr{args.lr:g}_mu{args.mu:g}"
+           f"_b1{args.beta1:g}_b2{args.beta2:g}_wd{wd:g}"
+           f"_bs{args.batch_size}_n{args.n_nodes}_r{args.n_rounds}")
+    if args.warmup_rounds > 0:
+        tag += f"_wu{args.warmup_rounds}"
+    if args.lr_schedule != "constant":
+        tag += f"_{args.lr_schedule}"
     return os.path.join("results", tag + ".json")
 
 
