@@ -607,9 +607,7 @@ def train_zo(model, data, device, args, logger):
     watch = CollapseWatch(args, model.fc.out_features)
     sig_window = []  # 매 라운드 |g^T z| (probe 없어도 delta로 계산 가능)
     for rnd in range(1, args.n_rounds + 1):
-        seed = int(torch.randint(0, 2**31 - 1, (1,)).item())  # 라운드당 seed 1개 broadcast
-
-        # 각 노드가 로컬 배치 하나씩 샘플 (± 두 평가에 같은 배치 재사용)
+        # 각 노드가 로컬 배치 하나씩 샘플.
         batches = [
             get_batch(x_train, y_train, args.batch_size, device,
                       indices=ni, augment=args.use_augment, dtype=dtype)
@@ -618,28 +616,67 @@ def train_zo(model, data, device, args, logger):
 
         # θ 스냅샷 복원 방식: 산술 복원(+μ→−2μ→+μ)은 bf16에서 rounding 잔차가
         # μ와 같은 스케일(~1e-2)로 남아 매 라운드 θ를 오염시킴 → copy로 정확 복원.
-        # 두 평가 모두 같은 θ에서 ±quantize(μz)로 대칭 처리됨. 메모리 +1x params.
         theta = [p.detach().clone() for p in params]
-        zo_perturb_(params, seed, +args.mu, device)
-        l_plus = zo_loss(model, batches)
-        for p_, t_ in zip(params, theta):
-            p_.data.copy_(t_)
-        zo_perturb_(params, seed, -args.mu, device)
-        l_minus = zo_loss(model, batches)
-        for p_, t_ in zip(params, theta):
-            p_.data.copy_(t_)
 
-        scalar = (l_plus - l_minus) / (2 * args.mu)
+        if args.seed_mode == "shared":
+            # 라운드당 Q개 seed를 전 노드에 broadcast. 모든 노드가 같은 z에서
+            # 자기 배치 loss를 평가 → 서버는 노드 평균 L̄±로 scalar 하나를 만든다.
+            # Q개 query 전부 같은 배치를 씀 → 배치 노이즈는 공통, z 방향 분산만 1/Q.
+            seeds = [int(torch.randint(0, 2**31 - 1, (1,)).item())
+                     for _ in range(args.n_queries)]
+            scalars = []
+            for sd in seeds:
+                zo_perturb_(params, sd, +args.mu, device)
+                lp = zo_loss(model, batches)
+                for p_, t_ in zip(params, theta):
+                    p_.data.copy_(t_)
+                zo_perturb_(params, sd, -args.mu, device)
+                lm = zo_loss(model, batches)
+                for p_, t_ in zip(params, theta):
+                    p_.data.copy_(t_)
+                scalars.append((lp - lm) / (2 * args.mu))
+                if sd is seeds[0]:
+                    l_plus, l_minus = lp, lm  # probe/로그는 첫 query 기준
+        else:  # per_node
+            # 노드마다 다른 seed. 각 노드가 자기 z로 자기 배치만 평가 → scalar_i.
+            # 서버는 pseudo_grad를 평균: mean_i(scalar_i·z_i).
+            # shared와 달리 각 항의 z가 다르므로 cross term (g_A^T z_B 등)이 노이즈로
+            # 남는다. 노드당 Q개씩 뽑아 총 N·Q 방향 (shared의 Q와 예산이 다름에 주의).
+            seeds, scalars = [], []
+            for ni_batch in batches:
+                for _ in range(args.n_queries):
+                    sd = int(torch.randint(0, 2**31 - 1, (1,)).item())
+                    zo_perturb_(params, sd, +args.mu, device)
+                    lp = zo_loss(model, [ni_batch])
+                    for p_, t_ in zip(params, theta):
+                        p_.data.copy_(t_)
+                    zo_perturb_(params, sd, -args.mu, device)
+                    lm = zo_loss(model, [ni_batch])
+                    for p_, t_ in zip(params, theta):
+                        p_.data.copy_(t_)
+                    seeds.append(sd)
+                    scalars.append((lp - lm) / (2 * args.mu))
+                    if len(seeds) == 1:
+                        l_plus, l_minus = lp, lm
+
+        scalar = float(np.mean(scalars))  # 진단/로그용 대표값
         running.append((l_plus + l_minus) / 2)
         sig_window.append(abs(scalar))  # |g^T z| 추정 (bias 미보정)
         cur_lr = lr_at(rnd, args)
 
         is_eval_round = (rnd % args.eval_every == 0 or rnd == args.n_rounds)
         probe = {}
+        # l_plus/l_minus는 첫 seed 기준이므로 진단도 같은 배치 범위를 써야 함
+        probe_batches = batches if args.seed_mode == "shared" else [batches[0]]
+        if len(scalars) > 1 and is_eval_round:
+            # query/노드 간 scalar 산포: 방향 추정 분산이 실제로 얼마나 되는지
+            probe["zo_scalar_std"] = float(f"{float(np.std(scalars)):.6e}")
+            probe["zo_scalar_mean"] = float(f"{scalar:.6e}")
+            probe["zo_n_directions"] = len(scalars)
         if args.curvature_check and is_eval_round:
             # 대칭성 검증: (L+ − L0) =? (L0 − L−). 차이 = L+ + L− − 2L0 ≈ μ²·zᵀHz
             # θ는 지금 복원된 상태이므로 무섭동 loss를 같은 배치로 한 번 더 측정
-            l_zero = zo_loss(model, batches)
+            l_zero = zo_loss(model, probe_batches)
             dplus, dminus = l_plus - l_zero, l_zero - l_minus
             probe.update({
                 "zo_dplus": float(f"{dplus:.6e}"),
@@ -647,10 +684,10 @@ def train_zo(model, data, device, args, logger):
                 "zo_curv": float(f"{dplus - dminus:.6e}"),
             })
         if args.precision_probe and is_eval_round:
-            # θ 복원된 지금 시점에 같은 seed/배치로 fp64 재측정
+            # θ 복원된 지금 시점에 같은 seed/배치로 fp64 재측정 (첫 seed 기준)
             delta_run = l_plus - l_minus
-            pr = precision_probe(model, params, theta, batches,
-                                 seed, args.mu, device, bias3=args.bias3_probe)
+            pr = precision_probe(model, params, theta, probe_batches,
+                                 seeds[0], args.mu, device, bias3=args.bias3_probe)
             probe.update({
                 "zo_delta": float(f"{delta_run:.6e}"),
                 "zo_delta_fp64": float(f"{pr['delta']:.6e}"),
@@ -663,16 +700,18 @@ def train_zo(model, data, device, args, logger):
                     "zo_grad_term": float(f"{pr['grad_term']:.6e}"),
                 })
 
-        # update: 같은 seed로 z 재생성 → pseudo_grad = scalar·z
+        # update: 같은 seed들로 z 재생성 → pseudo_grad = mean_q(scalar_q · z_q)
         # (계산은 fp32/fp64 master에서, 파라미터 적용 시에만 p.dtype으로 캐스팅)
-        g = torch.Generator(device=device).manual_seed(seed)
+        gens = [torch.Generator(device=device).manual_seed(sd) for sd in seeds]
         with torch.no_grad():
             for i, p in enumerate(params):
                 if args.zo_weight_decay > 0:
                     p.mul_(1 - cur_lr * args.zo_weight_decay)  # decoupled (AdamW식)
-                z = torch.randn(p.shape, generator=g, device=device,
-                                dtype=zo_gen_dtype(p))
-                grad = scalar * z
+                gdt = zo_gen_dtype(p)
+                grad = torch.zeros(p.shape, device=device, dtype=gdt)
+                for q, gen in enumerate(gens):
+                    z = torch.randn(p.shape, generator=gen, device=device, dtype=gdt)
+                    grad.add_(z, alpha=scalars[q] / len(gens))
                 if args.mode == "zo_sign":
                     p.sub_((cur_lr * grad.sign()).to(p.dtype))
                 else:  # zo_adam
@@ -715,6 +754,10 @@ def default_out(args):
     tag = (f"{args.mode}_{args.model}_{args.dtype}_lr{args.lr:g}_mu{args.mu:g}"
            f"_b1{args.beta1:g}_b2{args.beta2:g}_wd{wd:g}"
            f"_bs{args.batch_size}_n{args.n_nodes}_r{args.n_rounds}")
+    if args.n_queries > 1:
+        tag += f"_q{args.n_queries}"
+    if args.seed_mode != "shared":
+        tag += f"_{args.seed_mode}"
     if args.warmup_rounds > 0:
         tag += f"_wu{args.warmup_rounds}"
     if args.lr_schedule != "constant":
@@ -795,6 +838,18 @@ if __name__ == "__main__":
                    help="eval마다 무섭동 L0도 측정해서 (L+−L0) vs (L0−L−) 대칭성 검증. "
                         "zo_dplus / zo_dminus / zo_curv(=μ²·zᵀHz 추정) 기록 "
                         "(SPSA 선형근사 위반 = mu bias 추적, ZO 모드 전용)")
+    p.add_argument("--seed_mode", default="shared", choices=["shared", "per_node"],
+                   help="shared: 라운드당 seed를 전 노드에 broadcast, 모든 노드가 같은 z에서 "
+                        "자기 배치를 평가 → 서버가 L̄±로 scalar 하나 (SeedFlood 기본). "
+                        "per_node: 노드마다 다른 seed, 각자 자기 배치만 평가한 뒤 "
+                        "pseudo_grad를 평균 → cross term(g_A^T z_B)이 노이즈로 남음. "
+                        "방향 수가 shared는 Q개, per_node는 N·Q개라 예산이 다름에 주의")
+    p.add_argument("--n_queries", type=int, default=1,
+                   help="라운드당 z 방향 개수 Q (multi-query SPSA). "
+                        "pseudo_grad = mean_q(scalar_q·z_q)로 방향 추정 분산이 1/Q. "
+                        "forward 비용은 2Q배, 통신량은 (seed,scalar)×Q로 여전히 "
+                        "model size 무관. 모든 query가 같은 배치를 쓰므로 배치 노이즈는 "
+                        "안 줄고 z 방향 분산만 줄어듦 (batch_size 축과 분리)")
     p.add_argument("--n_nodes", type=int, default=1)
     p.add_argument("--act", default="relu",
                    choices=["relu", "gelu", "silu", "softplus", "elu",
