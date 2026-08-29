@@ -1,0 +1,25 @@
+# SeedFlood ZO base config (CLI 인자가 이 값들을 override함)
+mode: zo_adam
+model: resnet20
+dtype: fp32
+norm: group
+
+lr: 3.0e-5
+mu: 1.0e-2
+batch_size: 128
+n_rounds: 3000
+eval_every: 200
+warmup_rounds: 200
+lr_schedule: constant
+
+beta1: 0.99
+beta2: 0.999
+zo_weight_decay: 0.0
+n_nodes: 4
+
+precision_probe: true
+bias3_probe: true
+curvature_check: true
+early_abort: true
+abort_min_round: 1000
+abort_ratio: 100.0
