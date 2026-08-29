@@ -15,7 +15,7 @@ lr: 3.0e-4
 mu: 2.5e-3
 batch_size: 128
 n_rounds: 3000
-eval_every: 20
+eval_every: 200
 warmup_rounds: 200
 lr_schedule: constant
 
