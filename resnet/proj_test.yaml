@@ -14,8 +14,8 @@ zero_init_residual: false
 lr: 3.0e-4
 mu: 2.5e-3
 batch_size: 512
-n_rounds: 3000
-eval_every: 200
+n_rounds: 30000
+eval_every: 100
 warmup_rounds: 200
 lr_schedule: constant
 
@@ -27,7 +27,7 @@ beta1: 0.99
 beta2: 0.999
 zo_weight_decay: 0.0
 n_nodes: 1
-n_queries: 16     # 라운드당 z 방향 수 (분산 1/Q, forward 비용 2Q배)
+n_queries: 64     # 라운드당 z 방향 수 (분산 1/Q, forward 비용 2Q배)
 seed_mode: shared  # shared | per_node
 
 # 진단
